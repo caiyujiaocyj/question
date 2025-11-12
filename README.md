@@ -13,4 +13,10 @@ Traceback (most recent call last):
 TypeError: set_background_color(): incompatible function arguments. The following argument types are supported:
     1. (self: open3d.cuda.pybind.visualization.rendering.Open3DScene, arg0: numpy.ndarray[numpy.float32[4, 1]]) -> None
 
+
+scene.set_background_color(np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32))  
+
+
+
+
 Invoked with: <open3d.cuda.pybind.visualization.rendering.Open3DScene object at 0x7fa6e0bce730>, <open3d.cuda.pybind.visualization.gui.Color object at 0x7fa6e0bce970>
