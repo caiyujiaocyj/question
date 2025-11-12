@@ -1,1 +1,253 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GUI 版本管道可视化工具（Open3D 0.19+）
+- 使用 open3d.visualization.gui 显示
+- 保留原柱体绘制方式（线段风格）
+- 每根柱体旁添加 ID 标签
+- 兼容原数据加载与评估逻辑
+"""
 
+import numpy as np
+import os
+import pickle
+import glob
+import argparse
+import copy
+from tqdm import tqdm
+import open3d as o3d
+import open3d.visualization.gui as gui
+import open3d.visualization.rendering as rendering
+
+# ======================================================
+# 常量与参数
+# ======================================================
+LST_COLOR = [[0.6, 0.6, 0.6]] + [np.random.rand(3).tolist() for _ in range(100000)] + [[0, 0, 0]]
+THR_NUM_PTS_VALID = 10
+
+
+# ======================================================
+# 通用函数
+# ======================================================
+def parse_args():
+    parser = argparse.ArgumentParser(description='GUI Cylinder Visualization')
+    parser.add_argument('--dir_root', default='exp/NRDK/baseline_s2/result_gt_seg', type=str, help='Root result folder')
+    parser.add_argument('--rel_dir_fitted', type=str, default='cylinder_fitting_mcwei_20250929', help='Fitted folder')
+    args = parser.parse_args()
+    args.dir_fitted = os.path.join(args.dir_root, args.rel_dir_fitted)
+    args.dir_save_for_vis = os.path.join(args.dir_fitted, 'save_for_vis')
+    return args
+
+
+def point_to_line_distance_v2(pts, A, B):
+    A = np.array(A)
+    B = np.array(B)
+    AB = B - A
+    if np.linalg.norm(AB) < 1e-10:
+        return np.linalg.norm(pts - A, axis=1)
+    AP = pts - A
+    cross_product = np.cross(AP, AB)
+    cross_norm = np.linalg.norm(cross_product, axis=1)
+    dis = cross_norm / np.linalg.norm(AB)
+    return dis
+
+
+def get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=0.02):
+    direction = end - start
+    len_cyl = np.linalg.norm(direction)
+    if len_cyl < 1e-6:
+        return np.zeros_like(pts[:, 0], dtype=bool)
+    direction = direction / len_cyl
+    mask_inside_along_normal = point_to_line_distance_v2(pts, start, end) < radius
+    start_ext = start - direction * len_ext
+    end_ext = end + direction * len_ext
+    ES = start_ext - end_ext
+    SE = -ES
+    SP = pts - start_ext
+    EP = pts - end_ext
+    mask_inside_along_direction = (np.sum(SP * SE, axis=1) > 0) & (np.sum(EP * ES, axis=1) > 0)
+    mask_inside = mask_inside_along_normal & mask_inside_along_direction
+    return mask_inside
+
+
+# ======================================================
+# 线段构成的柱体（保留原逻辑）
+# ======================================================
+def create_cylinder_line(start, end, radius=0.001, color=[1, 0, 0]):
+    direction = np.subtract(end, start)
+    length = np.linalg.norm(direction)
+    if length < 1e-6:
+        return None
+    direction_unit = direction / length
+    cylinder = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=length, resolution=4)
+    z_axis = np.array([0, 0, 1])
+    rotation_axis = np.cross(z_axis, direction_unit)
+    rotation_angle = np.arccos(np.dot(z_axis, direction_unit))
+    if np.linalg.norm(rotation_axis) > 1e-6:
+        rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+        rotation_matrix = o3d.geometry.get_rotation_matrix_from_axis_angle(rotation_axis * rotation_angle)
+        cylinder.rotate(rotation_matrix, center=(0, 0, 0))
+    cylinder.translate(np.mean([start, end], axis=0))
+    cylinder.paint_uniform_color(color)
+    return cylinder
+
+
+def add_cylinder_lines(cyl, color):
+    """
+    构造线段风格的圆柱体（返回几何列表）
+    """
+    geometries = []
+    if isinstance(cyl, dict):
+        start = np.array(cyl['start'])
+        end = np.array(cyl['end'])
+        radius = cyl['radius']
+    else:
+        return geometries
+
+    v = end - start
+    height = np.linalg.norm(v)
+    if height < 1e-6:
+        return geometries
+    v_unit = v / height
+
+    # 中心线
+    center_line = create_cylinder_line(start, end, radius=0.002, color=color)
+    if center_line:
+        geometries.append(center_line)
+
+    # 环向和纵向线
+    if abs(v_unit[0]) > 0.5:
+        u = np.cross(v_unit, [0, 1, 0])
+    else:
+        u = np.cross(v_unit, [1, 0, 0])
+    u = u / np.linalg.norm(u)
+    w = np.cross(v_unit, u)
+    w = w / np.linalg.norm(w)
+
+    num_segments = 16
+    angles = np.linspace(0, 2 * np.pi, num_segments, endpoint=False)
+    top_points = [start + radius * (np.cos(a) * u + np.sin(a) * w) for a in angles]
+    bottom_points = [end + radius * (np.cos(a) * u + np.sin(a) * w) for a in angles]
+
+    for i in range(num_segments):
+        t_edge = create_cylinder_line(top_points[i], top_points[(i + 1) % num_segments], 0.002, color)
+        b_edge = create_cylinder_line(bottom_points[i], bottom_points[(i + 1) % num_segments], 0.002, color)
+        if t_edge:
+            geometries.append(t_edge)
+        if b_edge:
+            geometries.append(b_edge)
+    for i in range(0, num_segments, 2):
+        edge = create_cylinder_line(top_points[i], bottom_points[i], 0.002, color)
+        if edge:
+            geometries.append(edge)
+    return geometries
+
+
+# ======================================================
+# GUI 可视化
+# ======================================================
+def visualize_gui(lst_pred):
+    app = gui.Application.instance
+    app.initialize()
+
+    window = app.create_window("Cylinder Visualization (GUI)", 1280, 960)
+    widget3d = gui.SceneWidget()
+    widget3d.scene = rendering.Open3DScene(window.renderer)
+    widget3d.scene.set_background_color(gui.Color(0.1, 0.1, 0.1))
+
+    mat = rendering.MaterialRecord()
+    mat.shader = "defaultUnlit"
+
+    all_vertices = []
+
+    for param in lst_pred:
+        if 'radius' not in param:
+            continue
+        color = LST_COLOR[param.get('id', 1) + 1]
+        geoms = add_cylinder_lines(param, color)
+        for g in geoms:
+            name = f"cyl_{param.get('id', 0)}_{np.random.randint(9999)}"
+            widget3d.scene.add_geometry(name, g, mat)
+            all_vertices.append(np.asarray(g.vertices))
+
+        # 标签
+        start = np.asarray(param['start'], float)
+        end = np.asarray(param['end'], float)
+        radius = float(param['radius'])
+        center = (start + end) / 2.0
+        axis = end - start
+        n = np.linalg.norm(axis)
+        axis_dir = axis / n if n > 1e-6 else np.array([0, 0, 1.0])
+        pos = center + axis_dir * (radius + 0.08)
+        lbl = widget3d.add_3d_label(pos, f"ID:{param['id']}")
+        lbl.color = gui.Color(color[0], color[1], color[2])
+        lbl.scale = 1.0
+
+    # 自动相机
+    if len(all_vertices) > 0:
+        bbox = o3d.geometry.AxisAlignedBoundingBox.create_from_points(
+            o3d.utility.Vector3dVector(np.vstack(all_vertices))
+        )
+        widget3d.setup_camera(60.0, bbox, bbox.get_center())
+
+    window.add_child(widget3d)
+    app.run()
+
+
+# ======================================================
+# 主逻辑（保留原逻辑）
+# ======================================================
+def vis_single_block(path_pc, args):
+    dir_save_for_vis = args.dir_save_for_vis
+    name = os.path.basename(path_pc).replace('pkl', '')
+
+    res_fitting = pickle.load(open(os.path.join(dir_save_for_vis, f'{os.path.basename(path_pc)}.pkl'), 'rb'))
+    res_eval = pickle.load(open(os.path.join(dir_save_for_vis, f'eval_{os.path.basename(path_pc)}.pkl'), 'rb'))
+
+    gt = res_eval['gt']
+    lst_idx_gt_unmatched = res_eval['ug']
+    if not lst_idx_gt_unmatched:
+        return
+    pc = np.loadtxt(path_pc)
+    ind_pc = res_fitting['ind_pts']
+    pc = pc[ind_pc]
+    pc = pc[pc[:, 10] == 1]
+
+    mask_pc_fn = np.zeros_like(pc[:, 0], dtype=bool)
+    lst_idx_gt_unmatched_valid = []
+    for idx_gt in lst_idx_gt_unmatched:
+        cyl = res_eval['gt'][idx_gt]
+        mask_i = get_pc_mask_inside_cylinder(pc[:, :3], cyl['start'], cyl['end'], cyl['radius'] + 0.02, len_ext=0.02)
+        if sum(mask_i) > THR_NUM_PTS_VALID:
+            lst_idx_gt_unmatched_valid.append(idx_gt)
+        mask_pc_fn |= mask_i
+    if not lst_idx_gt_unmatched_valid:
+        return
+
+    pc_fitted = copy.deepcopy(pc)
+    pc_fitted[:, 11] = -1
+    pc_fitted[:, 12] = -1
+    lst_pred = []
+    for i, r in enumerate(res_fitting['results']):
+        start = r['start']
+        end = r['end']
+        radius = r['radius']
+        ind_inlier = r['ind_inlier']
+        if len(np.intersect1d(mask_pc_fn.nonzero()[0], ind_inlier)):
+            lst_pred.append(dict(id=i + 1, start=start, end=end, radius=radius))
+
+    # 使用 GUI 可视化
+    visualize_gui(lst_pred)
+    return
+
+
+def main(args):
+    lst_path_pc = glob.glob(os.path.join(args.dir_root, "*.pts"))
+    for i, path_pc in enumerate(lst_path_pc):
+        print(f'visualize GUI: {i}')
+        vis_single_block(path_pc, args)
+    return
+
+
+if __name__ == '__main__':
+    main(parse_args())
