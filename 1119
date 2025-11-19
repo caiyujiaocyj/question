@@ -1,0 +1,643 @@
+"""
+Usage
+```
+python evaluation.py --cloud cloud.pts --gt full_gt.txt --out eval_results
+```
+"""
+
+import argparse, ast, importlib, json, os, random
+import time, pdb
+from typing import List, Tuple
+import numpy as np, matplotlib.pyplot as plt
+import glob
+from tqdm import tqdm
+from multiprocessing import Pool
+import torch
+import pickle
+import torch.nn.functional as F
+from datetime import datetime
+# from src.utils.utils import save_ply
+
+pn = importlib.import_module("pipe_function")
+
+now = datetime.now()
+saved_name = f'cylinder_fitting_wo_merge__{now.month}_{now.day}_{now.hour}_{now.minute}'
+
+def seed_torch(seed=0):
+	random.seed(seed)
+	os.environ['PYTHONHASHSEED'] = str(seed)
+	np.random.seed(seed)
+	torch.manual_seed(seed)
+	torch.cuda.manual_seed(seed)
+	torch.backends.cudnn.benchmark = True
+	torch.backends.cudnn.deterministic = True
+
+# ────────────────────────── 1. GT I/O ──────────────────────────
+
+def _arr(t):
+    return np.asarray(ast.literal_eval(t.strip()))
+
+
+def load_gt(path: str):
+    if path.endswith('.csv'):
+        arr = np.loadtxt(path, delimiter=',')
+        return [{"start": arr[i, :3], "end": arr[i, 3:6], "radius": arr[i, 6]} for i in range(arr.shape[0])]
+    segs = []
+    s = e = r = None
+    for line in open(path, encoding='utf-8'):
+        l = line.strip()
+        if l.startswith('Start'):
+            s = _arr(l.split('Start:')[-1])
+        elif l.startswith('End'):
+            e = _arr(l.split('End:')[-1])
+        elif l.startswith('Radius'):
+            r = float(l.split('Radius:')[-1])
+        elif l == '' and s is not None and e is not None and r is not None:
+            segs.append({'start': s, 'end': e, 'radius': r})
+            s = e = r = None
+    if s is not None: segs.append({'start': s, 'end': e, 'radius': r})
+    return segs
+
+
+# ───────────────────── 2. Full cloud loader ───────────────────
+
+def save_cluster_arrays(lbl: np.ndarray, out_dir: str):
+    np.save(os.path.join(out_dir, "cluster_labels.npy"), lbl)
+
+    uniq = np.unique(lbl[lbl >= 0])  # ignore -1 noise
+    rng = np.random.default_rng(42)  # fixed seed for repeatability
+    label2col = {lb: rng.random(3) for lb in uniq}  # random RGB 0‑1
+
+    rgb = np.zeros((len(lbl), 3), dtype=np.float32)
+    for lb, col in label2col.items():
+        rgb[lbl == lb] = col
+    np.save(os.path.join(out_dir, "cluster_colors.npy"), rgb)
+
+
+def load_xyz(path):
+    return np.load(path)[:, :3] if path.endswith('.npy') else np.loadtxt(path)[:, :3]
+
+
+# ─────────────────── 3. generate prediction ───────────────────
+
+from typing import Optional
+
+
+def dir_reg2cls(dir):
+    X = sqrt_2_half =  2**0.5*0.5
+    # ref_directions = np.array([
+    #     [ 0.00,  0.71, -0.71, ], [ 0.00,  0.71,  0.71, ], [ 0.71,  -0.71,  0.00,], 
+    #     [ 0.71,  0.00, -0.71, ], [ 0.71, -0.00,  0.71, ], [ 0.71,   0.71, -0.00,], 
+    #     [ 0.00,  0.00,  1.00, ], [ 0.00,  1.00,  0.00, ], [ 1.00,   0.00,  0.00,]])
+    ref_directions = np.array([
+        [ 0.00,  0.71, -0.71, ], [ 0.00,  0.71,  0.71, ], [ 0.71,  -0.71,  0.00,], 
+        [ 0.71,  0.00, -0.71, ], [ 0.71, -0.00,  0.71, ], [ 0.71,   0.71, -0.00,], 
+        [ 0.00,  0.00,  1.00, ], [ 0.00,  1.00,  0.00, ], [ 1.00,   0.00,  0.00,]])
+    def cosine_similarity(pred, target):
+        pred = torch.tensor(pred)
+        target = torch.tensor(target)
+        pred_norm = F.normalize(pred, dim=-1)
+        gt_norm = F.normalize(target, dim=-1)
+        return F.cosine_similarity(pred_norm, gt_norm, dim=-1).abs() 
+    idx = np.array([cosine_similarity(dir, ref_directions[i]) for i in range(len(ref_directions))]).argmax(axis=0)
+    return ref_directions[idx] # new_dir
+
+    # new_dir=[]
+    # for d in dir:
+    #     new_d = ref_directions[
+    #         np.argmax(np.array([cosine_similarity(d,ref_d).mean() for ref_d in ref_directions]))]
+    #     new_dir.append(new_d)
+    # new_dir = np.array(new_dir)
+
+def generate_pred(cloud: str, out_dir,central=False):
+    """Run reconstruction and optionally save intermediate visualisations.
+
+    Args:
+        cloud: point‑cloud file path (.pts / .txt / .npy)
+        out_dir: if provided, three stage PNGs will be written there using the
+                 same names as the original script (step1_*, step2_*, step3_*).
+        central:三个方向的平均值
+    Returns:
+        (2N,4) array of flattened predicted segments.
+    """
+    downsample_factor = 1
+    offset = np.zeros(3)
+    sur_normals=[], 
+
+    if cloud.endswith('.npy'):
+        c, r, surf, d = pn.load_np_data(cloud)
+    elif cloud.endswith('.pts'):
+        c, r, surf, d, offset, instance_id,sur_normals = pn.load_txt_data(cloud, downsample_factor=downsample_factor,central=central)
+        #c, r, surf, d = pn.load_pts_data(cloud) # before
+    else:
+        c, r, surf, d,offset,instance_id = pn.load_txt_data(cloud,downsample_factor=downsample_factor,central=central)
+        """
+        20250926, mcwei
+        Inputs:
+            cloud: is a PCD file, shape is (n, 17)
+                pts = data[:, :3]
+                normals = data[:, 3:6]
+                direction = data[:, 6:9]
+                radii = data[:, 9]
+                cls = data[:, 10], semantic label, -1: ignore, 0: non-pipe, 1: pipe.
+                Others: I don't know.
+        Outputs: 只保留pipe点 (数目为n_pipe)，返回pipe点的各种属性. 
+            c: center line candidate points of pipe, shape is (n_pipe, 3). 根据surf, r, sur_normals计算得到.
+            r: predicted radius of pipe points, shape is (n_pipe,)
+            surf: points of pipe surface, shape is (n_pipe, 3)
+            d: predicted direction of pipe points, shape is (n_pipe, 3)
+            offset: offset = array([0., 0., 0.]), useless.
+            instance_id: shape is (n*downsample_factor)， instance_id[i] 表示降采样后的点云的第 i 个点在 cloud 中的索引位置。目前downsample_factor总是1，即不做降采样，但是顺序做了重排.
+                        （但该函数并未返回降采样后的点云，返回的其他变量都是对应于降采样后点云中类别是 pipe 的点。）
+                        现在这个量没用了，因为取消了降采样。
+            sur_normals: predicted normals of pipe points, shape is (n_pipe, 3)
+        """
+
+    # lbl = pn.region_growing_with_direction(c, d,radius=0.02)#0.02
+    # lbl = pn.radius_cluster(c,r)
+    # lbl, n ->d
+
+    if c.shape[0]==0:
+        return None, None, None
+    d = dir_reg2cls(d)
+    
+    lbl = pn.radius_cluster(c,r,d) #
+
+    # print((np.unique(lbl)))
+    start_time = time.time()  # 记录开始时间
+    #n->d
+    lbl = pn.hierarchical_region_growing(c,d,lbl,radius=0.1,min_points=5)#0.02 25
+    # import pdb; pdb.set_trace()
+    print(f"区域生长后的标签形状: {lbl.shape}")
+    """
+    20250926, mcwei
+    Outputs:
+        lbl: results of hierarchical_region_growing clustering. 
+            shape is (n_pipe,), -1: non cluster, >=0 cluster id:
+    """
+
+    d = pn.dir_est(sur_normals, lbl)
+    """
+    20250926, mcwei
+    Motivation: 
+        The ouput direction of parameter prediction is not reliable. 
+        But the output normals are somehow reliable, which can be used to generate more reliable direction. 
+    Function: For each cluster, estimate a new direction based on the normals.
+    Outputs:
+        d: the estimated direction. Invalid for these non-cluster points.
+            shape is (n_pipe, 3).
+    """
+
+    d = dir_reg2cls(d)
+
+    end_time = time.time()  # 记录结束时间
+    elapsed = end_time - start_time
+    # print(f"耗时: {elapsed:.6f} 秒")
+    # lbl = pn.dbscan_segments(c, r, d, lbl,eps_proj=0.02, min_samples_proj=30)
+    # lbl = pn.dbscan_cluster(c, r, d, lbl,eps_3d=0.02, min_samples_3d=30)
+    # print((np.unique(lbl)))
+    # start_time = time.time()  # 记录开始时间
+    segs,labels = pn.extract_segments(c, r, d, lbl,surf)
+    """
+    20250926, mcwei
+    Outputs:
+        segs: the fitted results of all clusters. It is a list, len(segs) is the cluster number.
+            segs[i] is a PipesSegment, which is corresponding to a cluster.
+            Following variables are exactly the input data of inliers points.
+                segs[i].directions: the input estimated direction of inlier points, shape is (n_inlier, 3).
+                segs[i].input_radii: the input radii of inlier points, shape is (n_inlier,).
+                segs[i].raw_points: the input centerline points of inlier points, shape is (n_inlier, 3).
+                segs[i].surf: inlier points, shape is (n_inlier, 3).
+            Following variables are output:
+                segs[i].centerline_end: fitted start point, shape is (3,) 
+                segs[i].centerline_start: fitted end point, shape is (3,) 
+                segs[i].length: length of fitted cylinder.
+                segs[i].radius: radius of fitted cylinder.
+                segs[i].direction: the average input estimated direction of this cluster, shape is (3,).
+                segs[i].ind_inlier: the indices of inlier points in the pipe points (surf and c), shape is (n_inlier,).
+                segs[i].ind_clustered: the indices of clustered points in the pipe points (surf and c), shape is (n_clustered,).
+                segs[i].lst_id_cluster: ids of the related cluster, which is used to get the related cluster of a fitted cylinder. list length is 1.
+    """
+
+    # end_time = time.time()  # 记录结束时间
+    # elapsed = end_time - start_time
+    # print(f"耗时: {elapsed:.6f} 秒")
+    # segs = None
+    # stage‑1 visual
+    # if out_dir:
+    #     os.makedirs(out_dir, exist_ok=True)
+    #     save_cluster_arrays(lbl, out_dir)
+    #     pn.visualize_segments(
+    #         segs, lbl, c, None,
+    #         save_path=os.path.join(out_dir, 'step1_segmented_centerline.png')
+    #     )
+
+    # RANSAC stage visual
+    # if out_dir:
+    #     c0, rad0 = pn.flatten_segments(segs)
+    #     np.save(os.path.join(out_dir, 'initial_pred.npy'), np.hstack([c0, rad0[:, None]]))
+    #     pn.visualize_segments(
+    #         segs,
+    #         save_path=os.path.join(out_dir, 'step2_segments_ransac.png')
+    #     )
+
+    # refinement & filter
+    # start_time = time.time()  # 记录开始时间
+    #segs = pn.refine_centerline_segments_with_direction(segs,distance_threshold=0.2,line_distance_threshold=0.1)
+    """
+    20250926, mcwei
+    Function: merging and filtering. 
+        But currently this will lead to a decline in recall and RED. So I comment out this line.
+    Outputs:
+        segs: same as above. 除了lst_id_cluster长度可能超过1 （多个cluster生成的圆柱被merge了）
+    """
+
+    # end_time = time.time()  # 记录结束时间
+    # elapsed = end_time - start_time
+
+    # 加入了对radius的估计
+    segs,raw_radius,new_radius = pn.filter_segments(segs)
+    """
+    20250926, mcwei
+    Function: 
+        1. Remove those cylinders that are too short, thin or thick.
+        2. Re-compute the radius based on the inlier points.
+    Outputs:
+        segs: the filtered fitted results of all clusters. It is a list, len(segs) is lt cluster number.
+            segs[i] is a PipesSegment, data structure is same as previous.
+    """
+
+    radius_mean_error, radius_accuracy = pn.evaluate_radius_estimation(raw_radius, new_radius,0.2)
+    print(f"{cloud.split('/')[-1], }: RED: {radius_mean_error},Acc: {radius_accuracy}%")
+    # final stage visual
+    # if out_dir:
+    #     file_name = cloud.split('/')[-1]
+    #     save_path = os.path.join(out_dir, f's3_{file_name}.png')
+    #     pn.visualize_segments(
+    #         segs, None, c, None,
+    #         save_path=save_path)
+
+    cl, rad = pn.flatten_segments(segs)
+    # print(f"耗时: {elapsed:.6f} 秒")
+
+    # 20250926, mcwei, save for visualization
+    res_for_vis = {}
+    res_for_vis['ind_pts'] = instance_id  # Overall indices
+    res_for_vis['results'] = []
+    for i_seg, seg in enumerate(segs):
+        res_for_vis['results'].append(dict(
+            id_in_block=i_seg,  # The local instance id in this block.
+            pc_clustered=surf[seg.ind_clustered],
+            ind_clustered=seg.ind_clustered,
+            ind_inlier=seg.ind_inlier,
+            d=d,
+            start=seg.centerline_start,
+            end=seg.centerline_end,
+            radius=seg.radius,
+            length=seg.length,
+        ))
+    file_save_for_vis = cloud.split('/')[-1] + '.pkl'
+    dir_save_for_vis = os.path.join(out_dir, 'save_for_vis')
+    os.makedirs(dir_save_for_vis, exist_ok=True)
+    pickle.dump(res_for_vis, open(os.path.join(dir_save_for_vis, file_save_for_vis), 'wb'))
+
+
+    return np.hstack([cl, rad[:, None]]),offset,radius_mean_error
+
+
+# ───────────── 4. Liang‑Barsky clipping functions ─────────────
+
+def _clip(p0, p1, mn, mx):
+    t0, t1 = 0., 1.
+    d = p1 - p0
+    for i in range(3):
+        if abs(d[i]) < 1e-12:
+            if p0[i] < mn[i] or p0[i] > mx[i]: return None
+        else:
+            inv = 1. / d[i]
+            tE = (mn[i] - p0[i]) * inv
+            tL = (mx[i] - p0[i]) * inv
+            if tE > tL: tE, tL = tL, tE
+            t0 = max(t0, tE)
+            t1 = min(t1, tL)
+            if t0 > t1: return None
+    return p0 + t0 * d, p0 + t1 * d
+
+
+def clip_gt(gt, xyz, margin=.05):
+    mn = xyz.min(0) - margin
+    mx = xyz.max(0) + margin
+    out = []
+    for g in gt:
+        res = _clip(np.asarray(g['start']), np.asarray(g['end']), mn, mx)
+        if res is None: continue
+        s, e = res
+        out.append({'start': s, 'end': e, 'radius': g['radius']})
+    return out
+
+
+# ───────────────────── 5. matching & metrics ───────────────────
+
+def _ang(u, v):
+    u = u / np.linalg.norm(u)
+    v = v / np.linalg.norm(v)
+    return np.degrees(np.arccos(np.clip(np.dot(u, v), -1, 1)))
+
+
+def _dist(a: dict, b: dict) -> float:
+    """Shortest distance between two finite line segments (a and b).
+
+    Uses the algorithm for the closest distance between two segments in 3‑D.
+    Returns **one scalar distance** in metres.
+    """
+    p, q = a['start'], b['start']
+    u, v = a['end'] - a['start'], b['end'] - b['start']
+    w0 = p - q
+
+    a_len = np.dot(u, u)
+    b_len = np.dot(v, v)
+    ab = np.dot(u, v)
+    aw = np.dot(u, w0)
+    bw = np.dot(v, w0)
+
+    denom = a_len * b_len - ab * ab + 1e-12  # avoid div‑by‑zero
+
+    s = (ab * bw - b_len * aw) / denom
+    t = (a_len * bw - ab * aw) / denom
+
+    s = np.clip(s, 0.0, 1.0)
+    t = np.clip(t, 0.0, 1.0)
+
+    closest_a = p + s * u
+    closest_b = q + t * v
+    return float(np.linalg.norm(closest_a - closest_b))
+
+
+# ───────────────────── 5b. many‑to‑many matching ───────────────────
+
+def match(pred: List[dict], gt: List[dict], dt=0.1, at=30, rr=0.25):
+    """Many‑to‑many: every pred–GT pair passing thresholds is a hit."""
+    matches = []
+    pred_hit = [False] * len(pred)
+    gt_hit = [False] * len(gt)
+    for pi, p in enumerate(pred):
+        for gi, g in enumerate(gt):
+            # print('Here:',p['radius'],g['radius'])
+            # if abs(p['radius']-g['radius'])/(g['radius']+1e-6)>rr: continue
+            if _ang(p['end'] - p['start'], g['end'] - g['start']) > at: continue
+            if _dist(p, g) > dt: continue
+            matches.append((pi, gi))
+            pred_hit[pi] = True
+            gt_hit[gi] = True
+    un_pred = [i for i, ok in enumerate(pred_hit) if not ok]
+    un_gt = [i for i, ok in enumerate(gt_hit) if not ok]
+    return matches, un_pred, un_gt
+
+
+# ───────────────────── 5c. metrics ───────────────────
+
+def metrics(pred, gt, m):
+    tp = len(set(i for i, _ in m))
+    fp = len(pred) - tp
+    fn = len(gt) - len(set(j for _, j in m))
+    prec = tp / (tp + fp + 1e-8)
+    rec = tp / (tp + fn + 1e-8)
+    f1 = 2 * prec * rec / (prec + rec + 1e-8)
+    if tp:
+        dist = np.mean([_dist(pred[i], gt[j]) for i, j in m])
+        ang = np.mean([_ang(pred[i]['end'] - pred[i]['start'], gt[j]['end'] - gt[j]['start']) for i, j in m])
+        rad = np.mean([abs(pred[i]['radius'] - gt[j]['radius']) for i, j in m])
+    else:
+        dist = ang = rad = float('nan')
+    tl = sum(np.linalg.norm(g['end'] - g['start']) for g in gt)
+    ml = sum(np.linalg.norm(gt[j]['end'] - gt[j]['start']) for _, j in m)
+
+    pred_len = sum(np.linalg.norm(p['end'] - p['start']) for p in pred)
+    # 这里似乎写错了，应该是j,_ in m,已经修改
+    match_len = sum(np.linalg.norm(pred[j]['end'] - pred[j]['start']) for j,_ in m)
+
+    return {'precision': prec, 'recall': rec, 'f1': f1, 'mean_end_dist': dist, 'mean_ang_deg': ang, 'mean_rad_err': rad,
+            'completeness': ml / (tl + 1e-8), 'len_precision': match_len / (pred_len + 1e-8), 'tp': tp, 'fp': fp,
+            'fn': fn}
+
+
+# ───────────────────── 6. visualisation ───────────────────
+
+def _set_axes_equal(ax):
+    """Make 3‑D axes have equal scale so that spheres appear as spheres.
+    Matplotlib trick: match the range on all 3 axes."""
+    x_limits = ax.get_xlim3d()
+    y_limits = ax.get_ylim3d()
+    z_limits = ax.get_zlim3d()
+    ranges = np.array([x_limits[1] - x_limits[0], y_limits[1] - y_limits[0], z_limits[1] - z_limits[0]])
+    centers = np.array([np.mean(x_limits), np.mean(y_limits), np.mean(z_limits)])
+    radius = 0.5 * ranges.max()
+    ax.set_xlim3d([centers[0] - radius, centers[0] + radius])
+    ax.set_ylim3d([centers[1] - radius, centers[1] + radius])
+    ax.set_zlim3d([centers[2] - radius, centers[2] + radius])
+
+
+def vis_roi(pred, gt, matches, out):
+    """Visualize ROI‑clipped GT vs. prediction **with pair annotations**.
+
+    * GT  : gray lines (unmatched) / green (matched)
+    * Pred: red  lines (FP)       / green (TP)
+    * Each (pred, GT) match is connected by a dashed blue line and labelled
+      with an integer ID so you can quickly inspect which segments correspond.
+    """
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # 显示范围一样 改
+    # 1) Collect all points to compute global bounds
+    all_points = []
+    for g in gt:
+        all_points.append(g['start'])
+        all_points.append(g['end'])
+    for p in pred:
+        all_points.append(p['start'])
+        all_points.append(p['end'])
+    all_points = np.array(all_points)
+
+    # 2) Compute unified axis limits (same for X/Y/Z)
+    min_val = np.min(all_points)
+    max_val = np.max(all_points)
+    padding = 0.1 * (max_val - min_val)  # 10% padding
+
+    ax.set_xlim(min_val - padding, max_val + padding)
+    ax.set_ylim(min_val - padding, max_val + padding)
+    ax.set_zlim(min_val - padding, max_val + padding)
+
+    # 3) Force equal aspect ratio (unit length一致)
+    ax.set_box_aspect([1, 1, 1])  # X:Y:Z = 1:1:1
+
+    matched_pred = {pi for pi, _ in matches}
+    matched_gt = {gi for _, gi in matches}
+
+
+    # 1) Plot GT segments first (so they appear behind predictions)
+    for gi, g in enumerate(gt):
+        col = 'limegreen' if gi in matched_gt else 'gray'
+        ax.plot([g['start'][0], g['end'][0]],
+                [g['start'][1], g['end'][1]],
+                [g['start'][2], g['end'][2]],
+                color=col, linewidth=0.3, alpha=0.8)
+
+    # 2) Plot predicted segments
+    for pi, p in enumerate(pred):
+        col = 'green' if pi in matched_pred else 'red'
+        ls = '-' if col == 'green' else '-'
+        ax.plot([p['start'][0], p['end'][0]],
+                [p['start'][1], p['end'][1]],
+                [p['start'][2], p['end'][2]],
+                color=col, linestyle=ls, linewidth=0.3, alpha=0.9)
+
+    # 3) Annotate each matched pair with an ID and a dashed connector
+    for idx, (pi, gi) in enumerate(matches, 1):
+        p_mid = 0.5 * (pred[pi]['start'] + pred[pi]['end'])
+        g_mid = 0.5 * (gt[gi]['start'] + gt[gi]['end'])
+        ax.plot([p_mid[0], g_mid[0]],
+                [p_mid[1], g_mid[1]],
+                [p_mid[2], g_mid[2]],
+                color='blue', linestyle=':', linewidth=1, alpha=0.6)
+        # place text slightly offset from GT midpoint to avoid overlap
+        # ax.text(g_mid[0], g_mid[1], g_mid[2], str(idx), color='blue', fontsize=9)
+
+    ax.set_title('GT (gray) • TP (green) • FP (red) • blue lines = matches')
+    plt.tight_layout()
+    plt.savefig(out, dpi=300)
+    plt.close(fig)
+
+
+def vis_raw(gt_raw, xyz, out, max_pts=80000):
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection='3d')
+    if len(xyz) > max_pts: xyz = xyz[np.random.choice(len(xyz), max_pts, replace=False)]
+    ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], s=1, alpha=.05, c='skyblue')
+    for g in gt_raw:
+        ax.plot([g['start'][0], g['end'][0]], [g['start'][1], g['end'][1]], [g['start'][2], g['end'][2]], c='black',
+                lw=1)
+    ax.set_title('Original GT + full cloud')
+    plt.tight_layout()
+    plt.savefig(out, dpi=300)
+    plt.close(fig)
+
+
+# ───────────────────── 7. main CLI ───────────────────
+
+def to_native(seg):
+    return {
+        "ID": seg.get("ID", ""),
+        "start": np.asarray(seg["start"]).tolist(),
+        "end": np.asarray(seg["end"]).tolist(),
+        "radius": float(seg["radius"]),
+    }
+
+
+def proc(file):
+    seed_torch(20251020)
+    results_path = os.path.dirname(file)
+    out = os.path.join(results_path,saved_name)
+    # file,out = args['file'], args['out']
+    os.makedirs(out, exist_ok=True)
+    file_name = file.split('/')[-1]
+    try:
+        pred_arr,offset,radius_mean_error = generate_pred(file, out)
+        if not isinstance(pred_arr,np.ndarray):
+            radius_mean_error = -1
+            return radius_mean_error
+        pred_arr[:, :3] += offset
+        # np.save(os.path.join(out, 'pred.npy'), pred_arr)
+        pred = [{'start': pred_arr[2 * i, :3], 'end': pred_arr[2 * i + 1, :3], 'radius': float(pred_arr[2 * i, 3])} for i in
+                range(pred_arr.shape[0] // 2)]
+        pred_json = [
+            {
+                'id': i,
+                'start': pred_arr[2 * i, :3].tolist(),  # 将 NumPy 数组转为 Python 列表
+                'end': pred_arr[2 * i + 1, :3].tolist(),
+                'radius': float(pred_arr[2 * i, 3])
+            }
+            for i in range(pred_arr.shape[0] // 2)
+        ]
+        # 保存为 JSON 文件
+        json_path = os.path.join(out, f'{file_name}.json')
+        with open(json_path, 'w') as f:
+            json.dump(pred_json, f, indent=4)
+    except:
+        print(file)
+        json_path = os.path.join(out, f'{file_name}.json')
+        pred_json = [{}],
+        with open(json_path, 'w') as f:
+            json.dump(pred_json, f, indent=4)
+        radius_mean_error = -1
+        pass
+        '''
+        xyz = load_xyz(args.cloud)
+        gt_raw = load_gt(args.gt)
+        gt = clip_gt(gt_raw, xyz)
+
+        with open(os.path.join(args.out, "clipped_gt.json"), "w", encoding="utf-8") as f:
+            json.dump([to_native(s) for s in gt], f, indent=2)
+        m, up, ug = match(pred, gt, dt=args.dt, at=args.at, rr=args.rr)
+        met = metrics(pred, gt, m)
+        json.dump(met, open(os.path.join(args.out, 'metrics.json'), 'w'), indent=2)
+        pred = [{'start': i['start'] - offset, 'end': i['end'] - offset, 'radius': i['radius']} for i in pred]
+        gt = [{'start': i['start'] - offset, 'end': i['end'] - offset, 'radius': i['radius']} for i in gt]
+
+        vis_roi(pred, gt, m, os.path.join(args.out, 'vis.png'))
+        vis_raw(gt_raw, xyz, os.path.join(args.out, 'raw_gt.png'))
+
+        with open(os.path.join(args.out, 'summary.txt'), 'w', encoding='utf-8') as f:
+            f.write('Metrics ')
+            f.write(json.dumps(met, indent=2))
+            f.write('Predicted segments:')
+            for i in range(pred_arr.shape[0] // 2):
+                s = pred_arr[2 * i]
+                e = pred_arr[2 * i + 1]
+                r = s[3]
+                f.write(f'{s[0]:.3f},{s[1]:.3f},{s[2]:.3f} -> {e[0]:.3f},{e[1]:.3f},{e[2]:.3f}, r={r:.4f}')
+        '''
+    return radius_mean_error
+# if __name__ == '__main__':
+#     pa = argparse.ArgumentParser('evaluate PipeNet')
+#     pa.add_argument('--cloud', required=True)
+#     pa.add_argument('--gt', required=False)
+#     pa.add_argument('--out', default='eval_results')
+#     pa.add_argument('--dt', type=float, default=0.05)
+#     pa.add_argument('--at', type=float, default=10)
+#     pa.add_argument('--rr', type=float, default=0.25)
+#     pa.add_argument('--central', action='store_true', default=False)
+#     args = pa.parse_args()
+#     os.makedirs(args.out, exist_ok=True)
+#     #  --cloud 2x2_2y2_4z1_GlobalId_data/select_pipe_cloud.txt 
+#     # --gt 2x2_2y2_4z1_GlobalId_data/select_pipe_GT.txt 
+#     # --out 2x2_2y2_4z1_GlobalId_result
+#     main(args)
+
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='evaluation')
+    parser.add_argument('--results_path', 
+                        default='/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1', #'exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1', 
+                        # default="/media/34.92/common-data-2t/data_tmp",
+                        type=str, help='path to checkpoint')
+    args = parser.parse_args()
+    results_path =  args.results_path
+    files = glob.glob(os.path.join(results_path, "*.pts"))
+    # files = ['exp/NRDK/baseline_s2/result/block_1Ftest_10_3_1.pts']
+    # files = files[:20]
+    seed_torch(20251020)
+    multi_proc = True
+    r_list = []
+    if multi_proc:
+        with Pool(32) as p:
+            r_list = list(tqdm(p.imap(proc, files), total=len(files)))
+    else:
+        for file in tqdm(files):
+            r_list.append(proc(file))
+    r_list = np.array(r_list)
+    r_list = r_list[r_list!=-1]
+    print(f"RED={r_list.mean()*100}%")
+
+    # files = glob.glob(os.path.join(results_path, 'cylinder_fitting', "*.json"))
