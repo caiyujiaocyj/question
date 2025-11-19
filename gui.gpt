@@ -1,1 +1,337 @@
 
+import argparse, ast, importlib, json, os, random
+import time, pdb
+from typing import List, Tuple
+import numpy as np, matplotlib.pyplot as plt
+import glob
+from tqdm import tqdm
+from multiprocessing import Pool
+import torch
+import pickle
+import torch.nn.functional as F
+from datetime import datetime
+
+# ★ 新增：导入 save_ply 函数（你提供的实现）
+from src.utils.utils import save_ply
+
+pn = importlib.import_module("pipe_function")
+
+now = datetime.now()
+saved_name = f'cylinder_fitting_wo_merge__{now.month}_{now.day}_{now.hour}_{now.minute}'
+
+
+def seed_torch(seed=0):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+
+
+# ────────────────────────── 1. GT I/O ──────────────────────────
+
+def _arr(t):
+    return np.asarray(ast.literal_eval(t.strip()))
+
+
+def load_gt(path: str):
+    if path.endswith('.csv'):
+        arr = np.loadtxt(path, delimiter=',')
+        return [{"start": arr[i, :3], "end": arr[i, 3:6], "radius": arr[i, 6]} for i in range(arr.shape[0])]
+    segs = []
+    s = e = r = None
+    for line in open(path, encoding='utf-8'):
+        l = line.strip()
+        if l.startswith('Start'):
+            s = _arr(l.split('Start:')[-1])
+        elif l.startswith('End'):
+            e = _arr(l.split('End:')[-1])
+        elif l.startswith('Radius'):
+            r = float(l.split('Radius:')[-1])
+        elif l == '' and s is not None and e is not None and r is not None:
+            segs.append({'start': s, 'end': e, 'radius': r})
+            s = e = r = None
+    if s is not None:
+        segs.append({'start': s, 'end': e, 'radius': r})
+    return segs
+
+
+# ───────────────────── 2. Full cloud loader ───────────────────
+
+def save_cluster_arrays(lbl: np.ndarray, out_dir: str):
+    np.save(os.path.join(out_dir, "cluster_labels.npy"), lbl)
+
+    uniq = np.unique(lbl[lbl >= 0])
+    rng = np.random.default_rng(42)
+    label2col = {lb: rng.random(3) for lb in uniq}
+
+    rgb = np.zeros((len(lbl), 3), dtype=np.float32)
+    for lb, col in label2col.items():
+        rgb[lbl == lb] = col
+    np.save(os.path.join(out_dir, "cluster_colors.npy"), rgb)
+
+
+def load_xyz(path):
+    return np.load(path)[:, :3] if path.endswith('.npy') else np.loadtxt(path)[:, :3]
+
+
+# ───────────────────── ★ cluster 保存函数（改为 PLY） ─────────────────────
+
+def save_clusters_with_res_for_vis(lbl, pts, cloud_path):
+    """
+    根据 lbl 聚类并保存 cluster 点云到 PLY 文件：
+    save_for_cluster/<block_name>/<cluster_id>.ply
+    """
+    block_name = os.path.basename(cloud_path).replace('.pts', '')
+    base_dir = os.path.join("save_for_cluster", block_name)
+    os.makedirs(base_dir, exist_ok=True)
+
+    unique_labels = [lb for lb in np.unique(lbl) if lb != -1]
+
+    print(f"\n保存 block={block_name} 的 clusters (PLY) ...")
+
+    for cid in unique_labels:
+        idx = np.where(lbl == cid)[0]
+        cluster_pts = pts[idx]          # (n_cluster, 3)
+        save_path = os.path.join(base_dir, f"{cid}.ply")  # ★ 改成 .ply
+
+        # ★ 使用你提供的 save_ply 函数，而不是 np.save
+        save_ply(cluster_pts, save_path)
+
+        print(f"  ✔ cluster {cid}: 点数={len(cluster_pts)} → {save_path}")
+
+    print(f"完成 block={block_name} 的 PLY cluster 保存.\n")
+
+
+# ─────────────────── 3. generate prediction ───────────────────
+
+from typing import Optional
+
+
+def dir_reg2cls(dir):
+    ref_directions = np.array([
+        [0.00, 0.71, -0.71], [0.00, 0.71, 0.71], [0.71, -0.71, 0.00],
+        [0.71, 0.00, -0.71], [0.71, -0.00, 0.71], [0.71, 0.71, -0.00],
+        [0.00, 0.00, 1.00], [0.00, 1.00, 0.00], [1.00, 0.00, 0.00]])
+
+    def cosine_similarity(pred, target):
+        pred = torch.tensor(pred)
+        target = torch.tensor(target)
+        pred_norm = F.normalize(pred, dim=-1)
+        gt_norm = F.normalize(target, dim=-1)
+        return F.cosine_similarity(pred_norm, gt_norm, dim=-1).abs()
+
+    idx = np.array([cosine_similarity(dir, ref_directions[i]) for i in range(len(ref_directions))]).argmax(axis=0)
+    return ref_directions[idx]
+
+
+def generate_pred(cloud: str, out_dir, central=False):
+
+    downsample_factor = 1
+    offset = np.zeros(3)
+    sur_normals = [],
+
+    if cloud.endswith('.npy'):
+        c, r, surf, d = pn.load_np_data(cloud)
+    elif cloud.endswith('.pts'):
+        c, r, surf, d, offset, instance_id, sur_normals = pn.load_txt_data(
+            cloud, downsample_factor=downsample_factor, central=central)
+    else:
+        c, r, surf, d, offset, instance_id = pn.load_txt_data(
+            cloud, downsample_factor=downsample_factor, central=central)
+
+    if c.shape[0] == 0:
+        return None, None, None
+
+    d = dir_reg2cls(d)
+    lbl = pn.radius_cluster(c, r, d)
+    lbl = pn.hierarchical_region_growing(c, d, lbl, radius=0.1, min_points=5)
+
+    d = pn.dir_est(sur_normals, lbl)
+    d = dir_reg2cls(d)
+
+    segs, labels = pn.extract_segments(c, r, d, lbl, surf)
+    segs, raw_radius, new_radius = pn.filter_segments(segs)
+
+    radius_mean_error, radius_accuracy = pn.evaluate_radius_estimation(raw_radius, new_radius, 0.2)
+    print(f"{cloud.split('/')[-1], }: RED: {radius_mean_error},Acc: {radius_accuracy}%")
+
+    cl, rad = pn.flatten_segments(segs)
+
+    # 原 save_for_vis 部分已注释掉
+
+    # ★ 新增：只输出 cluster 的 PLY
+    save_clusters_with_res_for_vis(lbl, surf, cloud)
+
+    return np.hstack([cl, rad[:, None]]), offset, radius_mean_error
+
+
+# ───────────────────── 后续代码（matching, metrics, vis 等保持不变） ─────────────────────
+
+def _clip(p0, p1, mn, mx):
+    t0, t1 = 0., 1.
+    d = p1 - p0
+    for i in range(3):
+        if abs(d[i]) < 1e-12:
+            if p0[i] < mn[i] or p0[i] > mx[i]:
+                return None
+        else:
+            inv = 1. / d[i]
+            tE = (mn[i] - p0[i]) * inv
+            tL = (mx[i] - p0[i]) * inv
+            if tE > tL:
+                tE, tL = tL, tE
+            t0 = max(t0, tE)
+            t1 = min(t1, tL)
+            if t0 > t1:
+                return None
+    return p0 + t0 * d, p0 + t1 * d
+
+
+def clip_gt(gt, xyz, margin=.05):
+    mn = xyz.min(0) - margin
+    mx = xyz.max(0) + margin
+    out = []
+    for g in gt:
+        res = _clip(np.asarray(g['start']), np.asarray(g['end']), mn, mx)
+        if res is None:
+            continue
+        s, e = res
+        out.append({'start': s, 'end': e, 'radius': g['radius']})
+    return out
+
+
+def _ang(u, v):
+    u = u / np.linalg.norm(u)
+    v = v / np.linalg.norm(v)
+    return np.degrees(np.arccos(np.clip(np.dot(u, v), -1, 1)))
+
+
+def _dist(a: dict, b: dict) -> float:
+    p, q = a['start'], b['start']
+    u, v = a['end'] - a['start'], b['end'] - b['start']
+    w0 = p - q
+    a_len = np.dot(u, u)
+    b_len = np.dot(v, v)
+    ab = np.dot(u, v)
+    aw = np.dot(u, w0)
+    bw = np.dot(v, w0)
+    denom = a_len * b_len - ab * ab + 1e-12
+    s = (ab * bw - b_len * aw) / denom
+    t = (a_len * bw - ab * aw) / denom
+    s = np.clip(s, 0.0, 1.0)
+    t = np.clip(t, 0.0, 1.0)
+    closest_a = p + s * u
+    closest_b = q + t * v
+    return float(np.linalg.norm(closest_a - closest_b))
+
+
+def match(pred: List[dict], gt: List[dict], dt=0.1, at=30, rr=0.25):
+    matches = []
+    pred_hit = [False] * len(pred)
+    gt_hit = [False] * len(gt)
+    for pi, p in enumerate(pred):
+        for gi, g in enumerate(gt):
+            if _ang(p['end'] - p['start'], g['end'] - g['start']) > at:
+                continue
+            if _dist(p, g) > dt:
+                continue
+            matches.append((pi, gi))
+            pred_hit[pi] = True
+            gt_hit[gi] = True
+    un_pred = [i for i, ok in enumerate(pred_hit) if not ok]
+    un_gt = [i for i, ok in enumerate(gt_hit) if not ok]
+    return matches, un_pred, un_gt
+
+
+def metrics(pred, gt, m):
+    tp = len(set(i for i, _ in m))
+    fp = len(pred) - tp
+    fn = len(gt) - len(set(j for _, j in m))
+    prec = tp / (tp + fp + 1e-8)
+    rec = tp / (tp + fn + 1e-8)
+    f1 = 2 * prec * rec / (prec + rec + 1e-8)
+    if tp:
+        dist = np.mean([_dist(pred[i], gt[j]) for i, j in m])
+        ang = np.mean([_ang(pred[i]['end'] - pred[i]['start'], gt[j]['end'] - gt[j]['start']) for i, j in m])
+        rad = np.mean([abs(pred[i]['radius'] - gt[j]['radius']) for i, j in m])
+    else:
+        dist = ang = rad = float('nan')
+
+    tl = sum(np.linalg.norm(g['end'] - g['start']) for g in gt)
+    ml = sum(np.linalg.norm(gt[j]['end'] - gt[j]['start']) for _, j in m)
+
+    pred_len = sum(np.linalg.norm(p['end'] - p['start']) for p in pred)
+    match_len = sum(np.linalg.norm(pred[j]['end'] - pred[j]['start']) for j, _ in m)
+
+    return {
+        'precision': prec,
+        'recall': rec,
+        'f1': f1,
+        'mean_end_dist': dist,
+        'mean_ang_deg': ang,
+        'mean_rad_err': rad,
+        'completeness': ml / (tl + 1e-8),
+        'len_precision': match_len / (pred_len + 1e-8),
+        'tp': tp, 'fp': fp, 'fn': fn
+    }
+
+
+# ───────────────────── 7. main CLI ───────────────────
+
+def to_native(seg):
+    return {
+        "ID": seg.get("ID", ""),
+        "start": np.asarray(seg["start"]).tolist(),
+        "end": np.asarray(seg["end"]).tolist(),
+        "radius": float(seg["radius"]),
+    }
+
+
+def proc(file):
+    seed_torch(20251020)
+    results_path = os.path.dirname(file)
+    out = os.path.join(results_path, saved_name)
+    os.makedirs(out, exist_ok=True)
+    file_name = file.split('/')[-1]
+
+    try:
+        # 这里只是触发 generate_pred，真正输出是 PLY cluster
+        pred_arr, offset, radius_mean_error = generate_pred(file, out)
+
+    except:
+        print(file)
+        # 出错就返回 -1，用于统计
+        return -1
+
+    return radius_mean_error
+
+
+# ───────────────────── main ─────────────────────
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='evaluation')
+    parser.add_argument(
+        '--results_path',
+        default='/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1',
+        type=str)
+    args = parser.parse_args()
+    results_path = args.results_path
+    files = glob.glob(os.path.join(results_path, "*.pts"))
+
+    seed_torch(20251020)
+    multi_proc = True
+    r_list = []
+
+    if multi_proc:
+        with Pool(32) as p:
+            r_list = list(tqdm(p.imap(proc, files), total=len(files)))
+    else:
+        for file in tqdm(files):
+            r_list.append(proc(file))
+
+    r_list = np.array(r_list)
+    r_list = r_list[r_list != -1]
+    print(f"RED={r_list.mean() * 100}%")
