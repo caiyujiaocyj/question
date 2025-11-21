@@ -17,5 +17,25 @@
 
     # 保存每个 cluster 的 surf 点（你也可以换成 c）
     for lb in valid_labels:
-        pts = surf[lbl == lb]  # 所有属于该 cluster 的点
+        pts = surf[lbl == lb]  # 所有属于该 cluster
+
+
+except Exception as e:
+    print("\n\n================= ERROR OCCURRED =================")
+    print("Block:", file)
+    print("Error:", e)
+    import traceback
+    traceback.print_exc()
+    print("=================================================\n\n")
+
+    radius_mean_error = -1
+    return radius_mean_error
+
+
+
+
+
+
+
+ 的点
         np.save(os.path.join(save_block_dir, f"{lb}.npy"), pts)
