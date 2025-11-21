@@ -1,41 +1,45 @@
+def save_ply(points, filename, colors=None):
+    """
+    将点云保存为PLY文件
+    :param points: numpy数组，形状为(n, 3)
+    :param filename: 输出文件名，如'output.ply'
+    :param colors: numpy数组，形状为(n, 3)
+    """
+    if isinstance(points, list):
+        if colors is None:
+            from src.utils.vis_utils import LST_COLOR
+            lst_num_pt = [len(p) for p in points]
+            colors = np.vstack([np.array([LST_COLOR[i]]).repeat(lst_num_pt[i], 0) for i in range(len(lst_num_pt))])
+        points = np.vstack(points)
 
-    # -------------------------------------------------------
-    #  在 generate_pred 内保存每个 cluster 的点
-    # -------------------------------------------------------
-    # 保存路径为 out_dir/save_for_cluster/block_name/
-    save_cluster_root = os.path.join(out_dir, "save_for_cluster")
-    os.makedirs(save_cluster_root, exist_ok=True)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points[:, :3])
+    if colors is not None:
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+    o3d.io.write_point_cloud(filename, pcd, write_ascii=True, compressed=False, print_progress=True)
 
-    # block 名字 (如 block_1F_test_3_5)
-    block_name = cloud.split('/')[-1].split('.')[0]
-    save_block_dir = os.path.join(save_cluster_root, block_name)
-    os.makedirs(save_block_dir, exist_ok=True)
+    with open(filename, 'w') as f:
+        # 写入PLY文件头部
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(points)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        if colors is not None:
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write("property uchar alpha\n")
+        f.write("end_header\n")
 
-    # 获取有效标签
-    unique_labels = np.unique(lbl)
-    valid_labels = unique_labels[unique_labels >= 0]
-
-    # 保存每个 cluster 的 surf 点（你也可以换成 c）
-    for lb in valid_labels:
-        pts = surf[lbl == lb]  # 所有属于该 cluster
-
-
-except Exception as e:
-    print("\n\n================= ERROR OCCURRED =================")
-    print("Block:", file)
-    print("Error:", e)
-    import traceback
-    traceback.print_exc()
-    print("=================================================\n\n")
-
-    radius_mean_error = -1
-    return radius_mean_error
-
-
-
-
-
-
-
- 的点
-        np.save(os.path.join(save_block_dir, f"{lb}.npy"), pts)
+        # 写入点云数据
+        if colors is not None:
+            if colors.max() <= 1:
+                colors = (colors * 255).astype(int)
+            for point, color in zip(points, colors):
+                f.write(f"{point[0]} {point[1]} {point[2]} {int(color[0])} {int(color[1])} {int(color[2])} {127}\n")
+        else:
+            for point in points:
+                f.write(f"{point[0]} {point[1]} {point[2]}\n")
+    print(f'Saved as {filename}')
