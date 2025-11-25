@@ -1,388 +1,897 @@
-"""
-Usage
-```
-python evaluation.py --cloud cloud.pts --gt full_gt.txt --out eval_results
-```
-"""
+import random
+import matplotlib.pyplot as plt
+from scipy.spatial import KDTree
+from numpy.linalg import svd
+from sklearn.neighbors import NearestNeighbors
+import numpy as np
+from typing import List, Tuple, Optional
+# last_cluster_labels = None
 
-import argparse, ast, importlib, json, os, random
-import time, pdb
-from typing import List, Tuple
-import numpy as np, matplotlib.pyplot as plt
-import glob
-from tqdm import tqdm
-from multiprocessing import Pool
-import torch
-import pickle
-import torch.nn.functional as F
-from datetime import datetime
-# import open3d as o3d
-# import numpy as np
-# from src.utils.utils import save_ply
-pn = importlib.import_module("pipe_function")
-
-now = datetime.now()
-saved_name = f'cylinder_fitting_wo_merge__{now.month}_{now.day}_{now.hour}_{now.minute}'
-
-
-def seed_torch(seed=0):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = True
-
-
-# ────────────────────────── 1. GT I/O ──────────────────────────
-
-def _arr(t):
-    return np.asarray(ast.literal_eval(t.strip()))
-
-
-def load_gt(path: str):
-    if path.endswith('.csv'):
-        arr = np.loadtxt(path, delimiter=',')
-        return [{"start": arr[i, :3], "end": arr[i, 3:6], "radius": arr[i, 6]} for i in range(arr.shape[0])]
-    segs = []
-    s = e = r = None
-    for line in open(path, encoding='utf-8'):
-        l = line.strip()
-        if l.startswith('Start'):
-            s = _arr(l.split('Start:')[-1])
-        elif l.startswith('End'):
-            e = _arr(l.split('End:')[-1])
-        elif l.startswith('Radius'):
-            r = float(l.split('Radius:')[-1])
-        elif l == '' and s is not None and e is not None and r is not None:
-            segs.append({'start': s, 'end': e, 'radius': r})
-            s = e = r = None
-    if s is not None: segs.append({'start': s, 'end': e, 'radius': r})
-    return segs
-
-
-# ───────────────────── 2. Full cloud loader ───────────────────
-
-def save_cluster_arrays(lbl: np.ndarray, out_dir: str):
-    np.save(os.path.join(out_dir, "cluster_labels.npy"), lbl)
-
-    uniq = np.unique(lbl[lbl >= 0])  # ignore -1 noise
-    rng = np.random.default_rng(42)  # fixed seed for repeatability
-    label2col = {lb: rng.random(3) for lb in uniq}  # random RGB 0‑1
-
-    rgb = np.zeros((len(lbl), 3), dtype=np.float32)
-    for lb, col in label2col.items():
-        rgb[lbl == lb] = col
-    np.save(os.path.join(out_dir, "cluster_colors.npy"), rgb)
-
-
-def load_xyz(path):
-    return np.load(path)[:, :3] if path.endswith('.npy') else np.loadtxt(path)[:, :3]
-
-
-# ─────────────────── 3. generate prediction ───────────────────
-
-from typing import Optional
-
-
-def dir_reg2cls(dir):
-    dir = torch.from_numpy(dir).float()
-    X = sqrt_2_half = 2 ** 0.5 * 0.5
-    # ref_directions = np.array([
-    #     [ 0.00,  0.71, -0.71, ], [ 0.00,  0.71,  0.71, ], [ 0.71,  -0.71,  0.00,],
-    #     [ 0.71,  0.00, -0.71, ], [ 0.71, -0.00,  0.71, ], [ 0.71,   0.71, -0.00,],
-    #     [ 0.00,  0.00,  1.00, ], [ 0.00,  1.00,  0.00, ], [ 1.00,   0.00,  0.00,]])
-    ref_directions = np.array([
-        [0.00, 0.71, -0.71, ], [0.00, 0.71, 0.71, ], [0.71, -0.71, 0.00, ],
-        [0.71, 0.00, -0.71, ], [0.71, -0.00, 0.71, ], [0.71, 0.71, -0.00, ],
-        [0.00, 0.00, 1.00, ], [0.00, 1.00, 0.00, ], [1.00, 0.00, 0.00, ]])
-
-    def cosine_similarity(pred, target):
-        pred = torch.tensor(pred)
-        target = torch.tensor(target)
-        pred_norm = F.normalize(pred, dim=-1)
-        gt_norm = F.normalize(target, dim=-1)
-        return F.cosine_similarity(pred_norm, gt_norm, dim=-1).abs()
-
-    idx = np.array([cosine_similarity(dir, ref_directions[i]) for i in range(len(ref_directions))]).argmax(axis=0)
-    return ref_directions[idx]  # new_dir
-
-    # new_dir=[]
-    # for d in dir:
-    #     new_d = ref_directions[
-    #         np.argmax(np.array([cosine_similarity(d,ref_d).mean() for ref_d in ref_directions]))]
-    #     new_dir.append(new_d)
-    # new_dir = np.array(new_dir)
-
-
-def generate_pred(cloud: str, out_dir, central=False):
-    """Run reconstruction and optionally save intermediate visualisations.
-
-    Args:
-        cloud: point‑cloud file path (.pts / .txt / .npy)
-        out_dir: if provided, three stage PNGs will be written there using the
-                 same names as the original script (step1_*, step2_*, step3_*).
-        central:三个方向的平均值
-    Returns:
-        (2N,4) array of flattened predicted segments.
+def centralize_data(data, central=True):
     """
-    downsample_factor = 1
+    将点云数据中心化（减去均值）并记录偏移量
+    参数:
+        data: 点云数据，形状为 (N, 3+) 的 NumPy 数组，前3列必须是 [x, y, z]
+        central: 是否执行中心化
+    返回:
+        data_centralized: 中心化后的数据（如果 central=False 则返回原数据）
+        offset: 三个方向的偏移量 [x_offset, y_offset, z_offset]
+    """
+    if not central:
+        return data, np.zeros(3)  # 不中心化时返回原数据和零偏移
+
+    # 提取前3列坐标（x, y, z）
+    xyz = data[:, :3]
+
+    # 计算各方向的均值（偏移量）
+    offset = np.mean(xyz, axis=0)
+
+    # 中心化：减去偏移量
+    data_centralized = data.copy()
+    data_centralized[:, :3] = xyz - offset
+
+    return data_centralized, offset
+def load_txt_data(file_path,downsample_factor=10,random_seed=1,central=False):
+    '''x,y,z,nx,ny,nz,dir,radius,semantic_label'''
+    data = np.loadtxt(file_path)
+    sampled_indices = np.arange(len(data))
+   
+    # 中心化
     offset = np.zeros(3)
-    sur_normals = [],
+    if central:
+        data, offset = centralize_data(data, central=True)
+    # instance_id = data[:,11]
+    points = data[:, :3]  # surface points
+    cls = data[:, 10][:]
+    normals = data[:, 3:6]  # surface normal, from surface to centerline
+    radii = data[:, 9]
+    # 这里是孟传的合成数据
+    # pipe_mask = np.isin(cls, [17, 35])
+    pipe_mask = cls==1
+    surface_points = points[pipe_mask]  # keep original surface points
+    surface_normals = normals[pipe_mask]
+    pipe_radii = radii[pipe_mask]
+    # instance_id = instance_id[pipe_mask]
+    centerline_points = surface_points - pipe_radii[:, None] * surface_normals
+    pipe_dirs = data[pipe_mask,6:9]  # fixed pipe direction
+    # all_points = data[:, :3]
+    return centerline_points, pipe_radii, surface_points, pipe_dirs, offset, sampled_indices,surface_normals
+def load_pts_data(file_path):
+    #points:x,y,z,r,nx,ny,nz,
+    data = np.loadtxt(file_path)
+    points = data[:, :3]  # surface points
+    cls = data[:, 10:13]
+    normals = data[:, 4:7]
+    normalss = np.linalg.norm(normals,axis=1,keepdims=True)+1e-8# surface normal, from surface to centerline
+    normals = normals/normalss
+    radii = data[:, 3]
+    pipe_mask = cls[:,1]==cls[:,2]
+    print(pipe_mask.sum())
+    surface_points = points[pipe_mask]  # keep original surface points
+    surface_normals = normals[pipe_mask]
+    pipe_radii = radii[pipe_mask]
+    # 法线朝外
+    centerline_points = surface_points - pipe_radii[:, None] * surface_normals
+    # 方向假设
+    pipe_dirs = np.tile(np.array([[0, 1, 0]]), (len(centerline_points), 1))  # fixed pipe direction
+    all_points = data[:, :3]
+    return centerline_points, pipe_radii, surface_points, pipe_dirs
+def load_np_data(file_path):
 
-    if cloud.endswith('.npy'):
-        c, r, surf, d = pn.load_np_data(cloud)
-    elif cloud.endswith('.pts'):
-        c, r, surf, d, offset, instance_id, sur_normals = pn.load_txt_data(cloud, downsample_factor=downsample_factor,
-                                                                           central=central)
-        # c, r, surf, d = pn.load_pts_data(cloud) # before
-    else:
-        c, r, surf, d, offset, instance_id = pn.load_txt_data(cloud, downsample_factor=downsample_factor,
-                                                              central=central)
-        """
-        20250926, mcwei
-        Inputs:
-            cloud: is a PCD file, shape is (n, 17)
-                pts = data[:, :3]
-                normals = data[:, 3:6]
-                direction = data[:, 6:9]
-                radii = data[:, 9]
-                cls = data[:, 10], semantic label, -1: ignore, 0: non-pipe, 1: pipe.
-                Others: I don't know.
-        Outputs: 只保留pipe点 (数目为n_pipe)，返回pipe点的各种属性. 
-            c: center line candidate points of pipe, shape is (n_pipe, 3). 根据surf, r, sur_normals计算得到.
-            r: predicted radius of pipe points, shape is (n_pipe,)
-            surf: points of pipe surface, shape is (n_pipe, 3)
-            d: predicted direction of pipe points, shape is (n_pipe, 3)
-            offset: offset = array([0., 0., 0.]), useless.
-            instance_id: shape is (n*downsample_factor)， instance_id[i] 表示降采样后的点云的第 i 个点在 cloud 中的索引位置。目前downsample_factor总是1，即不做降采样，但是顺序做了重排.
-                        （但该函数并未返回降采样后的点云，返回的其他变量都是对应于降采样后点云中类别是 pipe 的点。）
-                        现在这个量没用了，因为取消了降采样。
-            sur_normals: predicted normals of pipe points, shape is (n_pipe, 3)
-        """
+    data = np.load(file_path).astype(np.float32)
+    points = data[:, :3]  # surface points
+    cls = data[:, 3]
+    normals = data[:, 5:8]  # surface normal, from surface to centerline
+    radii = data[:, 4]
+    pipe_mask = cls >0
+    #np.set_printoptions(threshold=np.inf)
+    print(pipe_mask.sum())
+    surface_points = points[pipe_mask]  # keep original surface points
+    surface_normals = normals[pipe_mask]
+    pipe_radii = radii[pipe_mask]
+    centerline_points = surface_points - pipe_radii[:, None] * surface_normals
+    pipe_dirs = np.tile(np.array([[0, 1, 0]]), (len(centerline_points), 1))  # fixed pipe direction
+    all_points = data[:, :3]
+    return centerline_points, pipe_radii, surface_points, pipe_dirs
+def instance_cluster(instance_id):
+    # Get unique instance IDs
+    unique_ids = np.unique(instance_id)
 
-    # lbl = pn.region_growing_with_direction(c, d,radius=0.02)#0.02
-    # lbl = pn.radius_cluster(c,r)
-    # lbl, n ->d
+    # Create a dictionary to map instance_id to label
+    id_to_label = {id_: idx for idx, id_ in enumerate(unique_ids)}
 
-    if c.shape[0] == 0:
-        return None, None, None
-    d = dir_reg2cls(d)
+    # Convert instance_id array to labels
+    labels = np.array([id_to_label[id_] for id_ in instance_id], dtype=np.int32)
 
-    lbl = pn.radius_cluster(c, r, d)  #
-    """
-    20250926, mcwei
-    Outputs:
-        lbl: results of hierarchical_region_growing clustering. 
-            shape is (n_pipe,), -1: non cluster, >=0 cluster id:
-    """
+    return labels
 
-    # print((np.unique(lbl)))
-    start_time = time.time()  # 记录开始时间
-    # n->d
-    lbl = pn.hierarchical_region_growing(c, d, lbl, radius=0.1, min_points=5)  # 0.02 25
-    d = pn.dir_est(sur_normals, lbl)
-    """
-    20250926, mcwei
-    Motivation: 
-        The ouput direction of parameter prediction is not reliable. 
-        But the output normals are somehow reliable, which can be used to generate more reliable direction. 
-    Function: For each cluster, estimate a new direction based on the normals.
-    Outputs:
-        d: the estimated direction. Invalid for these non-cluster points.
-            shape is (n_pipe, 3).
-    """
+def region_growing_with_direction(points, directions, radius=0.2, angle_threshold=np.deg2rad(30), min_points=10):
+    nbrs = NearestNeighbors(radius=radius).fit(points)
+    all_neighbors = nbrs.radius_neighbors(points, return_distance=False)
+    visited = np.zeros(len(points), dtype=bool)
+    labels = -1 * np.ones(len(points), dtype=int)
+    current_label = 0
+    norm_directions = directions / (np.linalg.norm(directions, axis=1, keepdims=True) + 1e-6)
+    cos_threshold = np.cos(angle_threshold)
 
-    d = dir_reg2cls(d)
+    for i in range(len(points)):
+        if visited[i]:
+            continue
+        queue = [i]
+        visited[i] = True
+        segment = []
 
-    end_time = time.time()  # 记录结束时间
-    elapsed = end_time - start_time
-    # print(f"耗时: {elapsed:.6f} 秒")
-    # lbl = pn.dbscan_segments(c, r, d, lbl,eps_proj=0.02, min_samples_proj=30)
-    # lbl = pn.dbscan_cluster(c, r, d, lbl,eps_3d=0.02, min_samples_3d=30)
-    # print((np.unique(lbl)))
-    # start_time = time.time()  # 记录开始时间
-    segs, labels = pn.extract_segments(c, r, d, lbl, surf)
-    """
-    20250926, mcwei
-    Outputs:
-        segs: the fitted results of all clusters. It is a list, len(segs) is the cluster number.
-            segs[i] is a PipesSegment, which is corresponding to a cluster.
-            Following variables are exactly the input data of inliers points.
-                segs[i].directions: the input estimated direction of inlier points, shape is (n_inlier, 3).
-                segs[i].input_radii: the input radii of inlier points, shape is (n_inlier,).
-                segs[i].raw_points: the input centerline points of inlier points, shape is (n_inlier, 3).
-                segs[i].surf: inlier points, shape is (n_inlier, 3).
-            Following variables are output:
-                segs[i].centerline_end: fitted start point, shape is (3,) 
-                segs[i].centerline_start: fitted end point, shape is (3,) 
-                segs[i].length: length of fitted cylinder.
-                segs[i].radius: radius of fitted cylinder.
-                segs[i].direction: the average input estimated direction of this cluster, shape is (3,).
-                segs[i].ind_inlier: the indices of inlier points in the pipe points (surf and c), shape is (n_inlier,).
-                segs[i].ind_clustered: the indices of clustered points in the pipe points (surf and c), shape is (n_clustered,).
-                segs[i].lst_id_cluster: ids of the related cluster, which is used to get the related cluster of a fitted cylinder. list length is 1.
-    """
+        while queue:
+            idx = queue.pop()
+            segment.append(idx)
+            # neighbors = nbrs.radius_neighbors([points[idx]], return_distance=False)[0]
+            neighbors = all_neighbors[idx]
+            for n_idx in neighbors:
+                if visited[n_idx]:
+                    continue
+                # ang = angle_between(directions[idx], directions[n_idx])
+                # if ang < angle_threshold:
+                if np.dot(norm_directions[idx], norm_directions[n_idx]) > cos_threshold:
+                    visited[n_idx] = True
+                    queue.append(n_idx)
 
-    # end_time = time.time()  # 记录结束时间
-    # elapsed = end_time - start_time
-    # print(f"耗时: {elapsed:.6f} 秒")
-    # segs = None
-    # stage‑1 visual
-    # if out_dir:
-    #     os.makedirs(out_dir, exist_ok=True)
-    #     save_cluster_arrays(lbl, out_dir)
-    #     pn.visualize_segments(
-    #         segs, lbl, c, None,
-    #         save_path=os.path.join(out_dir, 'step1_segmented_centerline.png')
-    #     )
+        if len(segment) >= min_points:
+            for idx in segment:
+                labels[idx] = current_label
+            current_label += 1
+# 15 only
+#     print(len(np.unique(labels)))
+    return labels
 
-    # RANSAC stage visual
-    # if out_dir:
-    #     c0, rad0 = pn.flatten_segments(segs)
-    #     np.save(os.path.join(out_dir, 'initial_pred.npy'), np.hstack([c0, rad0[:, None]]))
-    #     pn.visualize_segments(
-    #         segs,
-    #         save_path=os.path.join(out_dir, 'step2_segments_ransac.png')
-    #     )
 
-    # refinement & filter
-    # start_time = time.time()  # 记录开始时间
-    # segs = pn.refine_centerline_segments_with_direction(segs,distance_threshold=0.2,line_distance_threshold=0.1)
-    """
-    20250926, mcwei
-    Function: merging and filtering. 
-        But currently this will lead to a decline in recall and RED. So I comment out this line.
-    Outputs:
-        segs: same as above. 除了lst_id_cluster长度可能超过1 （多个cluster生成的圆柱被merge了）
-    """
+def region_growing_with_direction_optimized(points, directions, radius=0.2, angle_threshold=np.deg2rad(30),
+                                            min_points=10, down_sample_factor=10):
+  
+    # Step 1: 对点云进行随机下采样
+    N = len(points)
+    if N < min_points:
+        return -1 * np.ones(N, dtype=int)
+    idx = np.random.choice(N, N // down_sample_factor, replace=False)
+    downsampled_points = points[idx]
+    downsampled_directions = directions[idx]
 
-    # end_time = time.time()  # 记录结束时间
-    # elapsed = end_time - start_time
+    # Step 2: 在下采样的点云上应用原始聚类算法
+    downsampled_labels = region_growing_with_direction(
+        downsampled_points, downsampled_directions,
+        radius, angle_threshold, min_points
+    )
+    unique_labels = np.unique(downsampled_labels)
+    unique_labels = unique_labels[unique_labels >= 0]  # 移除噪声点标签(-1)
 
-    # 加入了对radius的估计
-    segs, raw_radius, new_radius = pn.filter_segments(segs)
-    """
-    20250926, mcwei
-    Function: 
-        1. Remove those cylinders that are too short, thin or thick.
-        2. Re-compute the radius based on the inlier points.
-    Outputs:
-        segs: the filtered fitted results of all clusters. It is a list, len(segs) is lt cluster number.
-            segs[i] is a PipesSegment, data structure is same as previous.
-    """
+    # Step 3: 用所有下采样聚类点（不仅是中心）作为种子点
+    tree_full = KDTree(points)
+    labels_full = -1 * np.ones(N, dtype=int)
 
-    radius_mean_error, radius_accuracy = pn.evaluate_radius_estimation(raw_radius, new_radius, 0.2)
-    print(f"{cloud.split('/')[-1],}: RED: {radius_mean_error},Acc: {radius_accuracy}%")
-    # final stage visual
-    # if out_dir:
-    #     file_name = cloud.split('/')[-1]
-    #     save_path = os.path.join(out_dir, f's3_{file_name}.png')
-    #     pn.visualize_segments(
-    #         segs, None, c, None,
-    #         save_path=save_path)
+    for label in unique_labels:
+        # 获取当前聚类内的所有下采样点
+        seed_mask = (downsampled_labels == label)
+        cluster_seeds = downsampled_points[seed_mask]
 
-    cl, rad = pn.flatten_segments(segs)
-    # print(f"耗时: {elapsed:.6f} 秒")
+        # 对每个种子点，标记其原始点云中的邻域点
+        for seed in cluster_seeds:
+            neighbor_indices = tree_full.query_ball_point(seed, r=radius)
 
-    # 20250926, mcwei, save for visualization
-    res_for_vis = {}
-    res_for_vis['ind_pts'] = instance_id  # Overall indices
-    res_for_vis['results'] = []
-    for i_seg, seg in enumerate(segs):
-        res_for_vis['results'].append(dict(
-            id_in_block=i_seg,  # The local instance id in this block.
-            pc_clustered=surf[seg.ind_clustered],
-            ind_clustered=seg.ind_clustered,
-            ind_inlier=seg.ind_inlier,
-            d=d,
-            start=seg.centerline_start,
-            end=seg.centerline_end,
-            radius=seg.radius,
-            length=seg.length,
-        ))
-    file_save_for_vis = cloud.split('/')[-1] + '.pkl'
-    dir_save_for_vis = os.path.join(out_dir, 'save_for_vis')
-    os.makedirs(dir_save_for_vis, exist_ok=True)
-    pickle.dump(res_for_vis, open(os.path.join(dir_save_for_vis, file_save_for_vis), 'wb'))
-#############
-    save_cluster_root = os.path.join(out_dir, "save_for_cluster")
-    os.makedirs(save_cluster_root, exist_ok=True)
+            # 只标记未被分配或距离更近的点（避免重复覆盖）
+            for idx in neighbor_indices:
+                # if labels_full[idx] == -1:  # 未分配标签的点直接标记
+                labels_full[idx] = label
 
-    # block 名字 (如 block_1F_test_3_5)
-    block_name = cloud.split('/')[-1].split('.')[0]
-    save_block_dir = os.path.join(save_cluster_root, block_name)
-    os.makedirs(save_block_dir, exist_ok=True)
+    return labels_full
 
-    # 获取有效标签
-    unique_labels = np.unique(lbl)
-    valid_labels = unique_labels[unique_labels >= 0]
 
-    #保存每个 cluster 的 surf 点
-    for lb in valid_labels:
-        pts = surf[lbl == lb]  # 所有属于该 cluster 的点
-        # pcd = o3d.geometry.PointCloud()
-        # pcd.points = o3d.utility.Vector3dVector(pts[:, :3])  # Use only xyz coordinates
+# zhh: 差别是，用一个子集来作为搜索邻域的种子点
+def region_growing_with_direction2(points, directions, idx_seeds, radius=0.2, angle_threshold=np.deg2rad(30),
+                                   min_points=10):
+    nbrs = NearestNeighbors(radius=radius).fit(points)
+    points_seeds = points[idx_seeds]
+    labels = -1 * np.ones(len(points), dtype=int)
+    if points_seeds.shape[0]==0:
+        return labels
+    all_neighbors = nbrs.radius_neighbors(points_seeds, return_distance=False)
+
+    # 全集中向seed集的指针，-1表示不在seed中
+    idx_full2seed = [-1, ] * len(points)
+    for id_seed in range(len(idx_seeds)): idx_full2seed[idx_seeds[id_seed]] = id_seed
+
+    visited = np.zeros(len(points), dtype=bool)
     
-        # # Save as PLY (same name/location as original NPY)
-        # o3d.io.write_point_cloud(os.path.join(save_block_dir, f"{lb}.ply"), pcd)
+    current_label = 0
+    norm_directions = directions / (np.linalg.norm(directions, axis=1, keepdims=True) + 1e-6)
+    cos_threshold = np.cos(angle_threshold)
+
+    for id_seed in range(len(idx_seeds)):
+        i = idx_seeds[id_seed]  # i转成全集的idx.
+        assert idx_full2seed[i] == id_seed, 'wrong. data not consistent.'
+        if visited[i]: continue
+        queue = [i]  # 这里保存的是seed点，不过值表示fullset中的index.
+        visited[i] = True
+        segment = [i, ]  # 这里是full点集中的点
+
+        while queue:
+            idx = queue.pop()
+            # segment.append(idx)
+            # neighbors = nbrs.radius_neighbors([points[idx]], return_distance=False)[0]
+            neighbors = all_neighbors[idx_full2seed[idx]]
+            for n_idx in neighbors:
+                if visited[n_idx]:
+                    continue
+                # ang = angle_between(directions[idx], directions[n_idx])
+                # if ang < angle_threshold:
+                if np.dot(norm_directions[idx], norm_directions[n_idx])> cos_threshold: # modify yw
+                    visited[n_idx] = True
+                    segment.append(n_idx)
+                    if idx_full2seed[n_idx] >= 0: queue.append(n_idx)
+
+        if len(segment) >= min_points:
+            for idx in segment:
+                labels[idx] = current_label
+            current_label += 1
+    # 15 only
+    #     print(len(np.unique(labels)))
+    return labels
 
 
-        np.save(os.path.join(save_block_dir, f"{lb}.npy"), pts)
-       
- 
-########################
-    return np.hstack([cl, rad[:, None]]), offset, radius_mean_error
+# 张辉 updated: 打算实现相同的功能.
+def region_growing_with_direction_optimized2(points, directions, radius=0.2, angle_threshold=np.deg2rad(30),
+                                             min_points=10, down_sample_factor=10):
+  
+    # Step 1: 对点云进行随机下采样
+    N = len(points)
+    if N < min_points:
+        return -1 * np.ones(N, dtype=int)
+    idx = np.random.choice(N, N // down_sample_factor, replace=False)
+    # downsampled_points = points[idx]
+    # downsampled_directions = directions[idx]
 
+    # Step 2: 在下采样的点云上应用原始聚类算法
+    labels_full = region_growing_with_direction2(points, directions, idx, radius, angle_threshold, min_points)
+    return labels_full
 
-# ───────────── 4. Liang‑Barsky clipping functions ─────────────
+def hierarchical_region_growing(points, directions, initial_labels=None,radius=0.02, angle_threshold=np.deg2rad(30), min_points=30):
+    
+    if initial_labels is None:
+        # 如果没有初始标签，直接调用原函数
+        # return region_growing_with_direction(points, directions, radius, angle_threshold, min_points)
+        return region_growing_with_direction_optimized2(points, directions, radius, angle_threshold, min_points)
+    final_labels = -1 * np.ones_like(initial_labels)
+    label_offset = 0
 
-def _clip(p0, p1, mn, mx):
-    t0, t1 = 0., 1.
-    d = p1 - p0
-    for i in range(3):
-        if abs(d[i]) < 1e-12:
-            if p0[i] < mn[i] or p0[i] > mx[i]: return None
+    # 对每个初始组单独处理
+    for group_id in np.unique(initial_labels):
+        group_mask = (initial_labels == group_id)
+        group_points = points[group_mask]
+        group_directions = directions[group_mask]
+
+        
+        group_labels = region_growing_with_direction_optimized2(group_points, group_directions, radius, angle_threshold, min_points)
+        # 将当前组的有效标签（非-1）映射到全局标签空间
+        valid_mask = (group_labels != -1)
+        final_labels[group_mask] = np.where(
+            valid_mask,
+            group_labels + label_offset,
+            -1
+        )
+
+        # 更新标签偏移量（取当前组最大标签+1）
+        if np.any(valid_mask):
+            label_offset += np.max(group_labels[valid_mask]) + 1
+
+    return final_labels
+def radius_cluster(points, radius, dir, atol=0.001, enable_dir_clustering=True, angle_threshold=5.0):
+    
+    labels = np.full(len(points), -1, dtype=int)
+    current_label = 0
+
+    # 1. 按半径分组
+    unique_radii = np.unique(np.round(radius, decimals=6))
+
+    for r in unique_radii:
+        mask = np.isclose(radius, r, atol=atol)
+        group_indices = np.where(mask)[0]  # 当前半径组的原始索引
+
+        if len(group_indices) == 0:
+            continue
+
+        # 2. 如果启用方向分类，则进一步分组
+        if enable_dir_clustering:
+            group_dirs = dir[group_indices]
+
+            # 定义基准方向：x/y/z轴
+            ref_directions = np.array([
+                [1, 0, 0],  # x轴
+                [0, 1, 0],  # y轴
+                [0, 0, 1]  # z轴
+            ])
+
+            # 计算每个点与三个基准方向的余弦相似度
+            cosine_sim = np.abs(np.dot(group_dirs, ref_directions.T))  # (M, 3)
+            # cosine_sim = np.dot(group_dirs, ref_directions.T)  # (M, 3)
+
+            max_cosine = np.max(cosine_sim, axis=1)
+            best_match = np.argmax(cosine_sim, axis=1)  # 每个点最接近的基准方向索引
+
+            # 检查是否超过角度阈值（余弦值 >= cos(angle_threshold)）
+            cos_threshold = np.cos(np.deg2rad(angle_threshold))
+            valid_mask = (max_cosine >= cos_threshold)
+
+            # 分配标签：有效点按基准方向分组，无效点单独分组
+            for ref_idx in range(3):
+                dir_mask = (best_match == ref_idx) & valid_mask
+                if np.any(dir_mask):
+                    labels[group_indices[dir_mask]] = current_label
+                    current_label += 1
+
+            # 处理无效点（方向不匹配任何基准）
+            # invalid_mask = ~valid_mask
+            # if np.any(invalid_mask):
+            #     labels[group_indices[invalid_mask]] = current_label
+            #     current_label += 1        
         else:
-            inv = 1. / d[i]
-            tE = (mn[i] - p0[i]) * inv
-            tL = (mx[i] - p0[i]) * inv
-            if tE > tL: tE, tL = tL, tE
-            t0 = max(t0, tE)
-            t1 = min(t1, tL)
-            if t0 > t1: return None
-    return p0 + t0 * d, p0 + t1 * d
+            # 不启用方向分类，直接分配同一标签
+            labels[group_indices] = current_label
+            current_label += 1
+
+    return labels
+
+def dir_est(sur_normals, lbl):
+    # 获取所有唯一的标签
+    unique_labels = np.unique(lbl)
+    # 初始化结果数组，形状与 sur_normals 相同
+    a_est = np.zeros_like(sur_normals)
+
+    for i in unique_labels:
+        # 获取当前标签对应的法向量
+        if i==-1:
+            continue
+        mask = (lbl == i)
+        sur_normal = sur_normals[mask]
+
+        # 检查是否有足够的样本（至少 3 个点）
+        if sur_normal.shape[0] >= 3:
+            # 计算 SVD
+            _, _, Vt = svd(sur_normal, full_matrices=False)
+            # 最小奇异值对应的向量（Vt 的最后一行）
+            min_singular_vector = Vt[-1]
+            # 将结果填充到对应位置
+            a_est[mask] = min_singular_vector
+        else:
+            # 如果样本不足，填充零向量或跳过
+            a_est[mask] = np.zeros(3)
+    return a_est
+
+def ransac_line_fitting_with_direction(points, directions, max_iterations=100, distance_threshold=0.02,
+                                        min_inliers_ratio=0.4, angle_threshold=np.deg2rad(15)):
+    # distance_threshold important
+    best_inlier_count = 0
+    best_model = None
+    n_points = len(points)
+    min_inliers = int(n_points * min_inliers_ratio)
+
+    def angle_between(v1, v2):
+        v1 = v1 / (np.linalg.norm(v1) + 1e-6)
+        v2 = v2 / (np.linalg.norm(v2) + 1e-6)
+        return np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0))
+
+    for _ in range(max_iterations):
+        idx = np.random.choice(n_points, 2, replace=False)
+        p1, p2 = points[idx]
+        direction = p2 - p1
+        if np.linalg.norm(direction) < 1e-6:
+            continue
+        direction = direction / np.linalg.norm(direction)
+
+        vecs = points - p1
+        projections = np.dot(vecs, direction)[:, np.newaxis] * direction
+        dists = np.linalg.norm(vecs - projections, axis=1)
+        inlier_mask = dists < distance_threshold
+
+        if np.sum(inlier_mask) < min_inliers:
+            continue
+
+        avg_angle = np.mean([angle_between(direction, d) for d in directions[inlier_mask]])
+        if avg_angle > angle_threshold:
+            continue
+
+        inlier_count = np.sum(inlier_mask)
+        if inlier_count > best_inlier_count:
+            best_inlier_count = inlier_count
+            best_model = (direction, p1.copy(), inlier_mask)
+
+    if best_model is not None:
+        return best_model
+    else:
+        return None, None, np.ones(n_points, dtype=bool)
+def ransac_lines_fitting_with_direction(remaining_points, remaining_dirs, threshold=0.005,
+                                       max_iterations=1000, min_inliers=100):
+
+    if len(remaining_points) < min_inliers:
+        return None, None, None
+
+    n = remaining_points.shape[0]
+    best_inlier_count = 0
+    best_direction = None
+    best_point_on_line = None
+    best_inlier_mask = None
+
+    for _ in range(max_iterations):
+        # 随机选择一个点作为直线上的点
+        idx = np.random.randint(n)
+        point_on_line = remaining_points[idx]
+        direction = remaining_dirs[idx]
+
+        # 归一化方向向量
+        norm = np.linalg.norm(direction)
+        if norm < 1e-10:  # 避免零向量
+            continue
+        norm_direction = direction / norm
+
+        # 计算所有点到直线的距离
+        vectors = remaining_points - point_on_line
+        cross_products = np.cross(vectors, norm_direction)
+        distances = np.linalg.norm(cross_products, axis=1)
+
+        # 确定内点
+        inlier_mask = distances < threshold
+        inlier_count = np.sum(inlier_mask)
+        if inlier_count < min_inliers:
+            continue
+        # 提前终止：如果当前内点已经远超过历史最佳
+        if inlier_count > best_inlier_count and inlier_count >= min_inliers:
+            best_inlier_count = inlier_count
+            best_direction = norm_direction
+            best_point_on_line = point_on_line
+            best_inlier_mask = inlier_mask
+
+            # 提前终止条件：如果找到足够多的内点
+            if inlier_count > 0.9 * n:  # 90%的点都是内点
+                break
+
+    # 检查最终内点数量是否满足要求
+    if best_inlier_count < min_inliers:
+        return None, None, None
+
+    # 使用所有内点重新拟合直线
+    inlier_points = remaining_points[best_inlier_mask]
+    best_point_on_line = np.mean(inlier_points, axis=0)  # 使用内点的均值作为直线上的点
+
+    # 方向取内点方向的平均值并归一化
+    inlier_dirs = remaining_dirs[best_inlier_mask]
+    best_direction = np.mean(inlier_dirs, axis=0)
+    norm = np.linalg.norm(best_direction)
+    if norm < 1e-10:  # 处理零向量情况
+        best_direction = np.array([1.0, 0.0, 0.0])  # 默认方向
+    else:
+        best_direction = best_direction / norm
+
+    return best_direction, best_point_on_line, best_inlier_mask
+def fit_cylinder_with_custom_ransac(points, input_radii, directions):
+    if len(points) < 3:
+        # fallback for extremely small clusters
+        center = np.mean(points, axis=0)
+        direction = np.mean(directions, axis=0)
+        direction = direction / (np.linalg.norm(direction) + 1e-6)
+        start = center - 0.5 * np.mean(input_radii) * direction
+        end = center + 0.5 * np.mean(input_radii) * direction
+        radius = np.mean(input_radii)
+        return start, end, direction, radius
+
+    direction, point_on_line, inlier_mask = ransac_line_fitting_with_direction(points, directions)
+    if direction is None or np.linalg.norm(np.ptp(points, axis=0)) < 0.5*np.mean(input_radii):
+        # fallback to direction-aware fitting using average direction
+        print("WAY TOO SHORT!!!!")
+        center = np.mean(points, axis=0)
+        direction = np.mean(directions, axis=0)
+        #direction = direction / (np.linalg.norm(direction) + 1e-6)
+        projections = np.dot(points - center, direction)
+        t_min, t_max = np.min(projections), np.max(projections)
+        start = center + t_min * direction
+        end = center + t_max * direction
+    else:
+        inlier_points = points[inlier_mask]
+        projections = np.dot(inlier_points - point_on_line, direction)
+        t_min, t_max = np.min(projections), np.max(projections)
+        start = point_on_line + t_min * direction
+        end = point_on_line + t_max * direction
+
+    radius = np.mean(input_radii[inlier_mask]) if direction is not None else np.mean(input_radii)
+    return start, end, direction, radius
+def fit_cylinders_with_custom_ransac(points,input_radii,directions,min_points_per_pipe=30,max_pipes=5):
+    remaining_points = points.copy()
+    remaining_radii = input_radii.copy()
+    remaining_dirs = directions.copy()
+    pipes = []
+
+    for _ in range(max_pipes):
+        if len(remaining_points) < min_points_per_pipe:
+            break
+
+        # 拟合当前管道
+        direction, point_on_line, inlier_mask = ransac_lines_fitting_with_direction(
+            remaining_points, remaining_dirs,min_inliers=int(0.2*len(remaining_points))
+        )
+        if direction is None:
+            break
+
+        inlier_points = remaining_points[inlier_mask]
+        inlier_radii = remaining_radii[inlier_mask]
+        inlier_dirs = remaining_dirs[inlier_mask]
+
+        # 计算中心线端点
+        projections = np.dot(inlier_points - point_on_line, direction)
+        t_min, t_max = np.min(projections), np.max(projections)
+        start = point_on_line + t_min * direction
+        end = point_on_line + t_max * direction
+        radius = np.mean(inlier_radii)
+
+        # # 检查方向一致性（过滤噪声）
+        # dir_errors = np.arccos(np.clip(np.abs(np.dot(inlier_dirs, direction)), 0, 1))
+        # if np.mean(dir_errors) > angle_threshold:
+        #     continue  # 跳过方向不一致的管道
+
+        # # 检查半径一致性（避免合并不同管道）
+        # if np.ptp(inlier_radii) > radius_diff_threshold:
+        #     continue  # 跳过半径差异过大的区域
+
+        # 保存当前管道
+        pipes.append((start, end, direction, radius,inlier_points, inlier_radii,inlier_dirs))
+
+        # 移除已拟合的点
+        remaining_points = remaining_points[~inlier_mask]
+        remaining_radii = remaining_radii[~inlier_mask]
+        remaining_dirs = remaining_dirs[~inlier_mask]
+
+    return pipes
+# ransac 检测多条直线fit_line_ransac和detect_multiple_pipes,fit_line_ransac_dir
+def fit_line_ransac_dir_radius(points, dir_vec, min_samples,radius,ratio=0.2, max_trials=1000,seed=1):
+    """
+    使用已知方向向量的RANSAC直线拟合
+    random.seed(1)
+    best_inliers = []
+    best_start = None
+    best_end = None
+    n_points = len(points)
+    # 确保方向向量是单位向量
+    dir_vec = dir_vec / np.linalg.norm(dir_vec)
+    cross_matrix = np.array([
+        [0, -dir_vec[2], dir_vec[1]],
+        [dir_vec[2], 0, -dir_vec[0]],
+        [-dir_vec[1], dir_vec[0], 0]
+    ])
+    for _ in range(max_trials):
+        # 1. 随机采样1个点（不再需要采样2个点）
+        idx_sample = random.randint(0, n_points - 1)
+        pt = points[idx_sample]
+        radii = radius[idx_sample]
+   
+        mask = distances <= ratio
+        inliers = mask.nonzero()[0]  # 更高效
+
+        # 5. 更新最佳模型
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+            # 起点和终点取内点的最小/最大投影点,pt是否需要取mean，或者pt不断迭代
+            pt = np.mean(points[best_inliers],axis=0)
+            projections = np.dot(points[inliers] - pt, dir_vec)
+            best_start = pt + np.min(projections) * dir_vec
+            best_end = pt + np.max(projections) * dir_vec
+    if len(best_inliers) <= min_samples:
+        return None  # 未找到有效直线
+    return best_start, best_end, dir_vec, best_inliers
+def fit_line_ransac_dir(points, dir_vec, residual_threshold=0.2, max_trials=1000):
+    """
+    使用已知方向向量的RANSAC直线拟合
+    参数:
+        points: 点云数据 (N x 3)
+        dir_vec: 已知的单位方向向量 [dx, dy, dz]
+        residual_threshold: 内点距离阈值（点到直线的最大允许距离）
+        max_trials: 最大迭代次数
+    返回:
+        start: 直线起点 [x, y, z]
+        end: 直线终点 [x, y, z]
+        direction: 单位方向向量 [dx, dy, dz]（与输入的dir_vec相同）
+        inliers: 内点索引列表
+    """
+    best_inliers = []
+    best_start = None
+    best_end = None
+    n_points = len(points)
+    # 确保方向向量是单位向量
+    dir_vec = dir_vec / np.linalg.norm(dir_vec)
+    for _ in range(max_trials):
+        # 1. 随机采样1个点（不再需要采样2个点）
+        idx_sample = random.randint(0, n_points - 1)
+        pt = points[idx_sample]
+        # 2. 直接使用已知方向向量dir_vec，无需计算方向
+        # 3. 计算所有点到直线的距离
+        # 方法：距离 = ||(p - pt) × dir_vec||（dir_vec已经是单位向量）
+        vec_to_pt = points - pt
+        cross_product = np.cross(vec_to_pt, dir_vec)
+        distances = np.linalg.norm(cross_product, axis=1)
+        # 4. 筛选内点
+        inliers = np.where(distances <= residual_threshold)[0]
+        # 5. 更新最佳模型
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+            # 起点和终点取内点的最小/最大投影点
+            projections = np.dot(points[inliers] - pt, dir_vec)
+            best_start = pt + np.min(projections) * dir_vec
+            best_end = pt + np.max(projections) * dir_vec
+    if len(best_inliers) == 0:
+        return None  # 未找到有效直线
+    return best_start, best_end, dir_vec, best_inliers
+def fit_line_ransac(points, residual_threshold=0.2, max_trials=1000):
+    """
+    纯NumPy实现的RANSAC直线拟合
+    参数:
+        points: 点云数据 (N x 3)
+        residual_threshold: 内点距离阈值（点到直线的最大允许距离）
+        max_trials: 最大迭代次数
+    返回:
+        start: 直线起点 [x, y, z]
+        end: 直线终点 [x, y, z]
+        direction: 单位方向向量 [dx, dy, dz]
+        inliers: 内点索引列表
+    """
+    best_inliers = []
+    best_start = None
+    best_end = None
+    best_direction = None
+    n_points = len(points)
+
+    for _ in range(max_trials):
+        # 1. 随机采样2个点
+        idx_samples = random.sample(range(n_points), 2)
+        pt1, pt2 = points[idx_samples]
+
+        # 2. 计算直线方向向量
+        direction = pt2 - pt1
+        norm = np.linalg.norm(direction)
+
+        # 避免两点重合导致方向为0
+        if norm < 1e-6:
+            continue
+
+        direction = direction / norm  # 单位化
+
+        # 3. 计算所有点到直线的距离
+        # 方法：距离 = ||(p - pt1) × direction|| / ||direction|| (因direction是单位向量，分母为1)
+        vec_to_pt1 = points - pt1
+        cross_product = np.cross(vec_to_pt1, direction)
+        distances = np.linalg.norm(cross_product, axis=1)
+
+        # 4. 筛选内点
+        inliers = np.where(distances <= residual_threshold)[0]
+
+        # 5. 更新最佳模型
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+            best_direction = direction
+            # 起点和终点取内点的最小/最大投影点
+            projections = np.dot(points[inliers] - pt1, direction)
+            start = pt1 + np.min(projections) * direction
+            end = pt1 + np.max(projections) * direction
+
+    if len(best_inliers) == 0:
+        return None  # 未找到有效直线
+
+    return start, end, best_direction, best_inliers
+def detect_multiple_pipes(
+        points: np.ndarray,
+        directions: Optional[np.ndarray] = None,
+        radii: Optional[np.ndarray] = None,
+        surf: Optional[np.ndarray] = None,
+        max_pipes: int = 10,
+        min_samples_ratio: float=0.2,
+        min_samples=30,
+        residual_threshold: float = 0.2,
+        max_trials: int = 1000
+) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray],Optional[np.ndarray]]]:
+   
+    min_samples = min(min_samples,min_samples_ratio * len(points))
+    # 初始化全局索引
+    global_indices = np.arange(len(points))
+    remaining_indices = global_indices.copy()
+    remaining_points = points.copy()
+    remaining_dirs = directions.copy() if directions is not None else None
+    remaining_radii = radii.copy() if radii is not None else None
+    remaining_surf = surf.copy() if surf is not None else None
+
+    pipes = []
+
+    for _ in range(max_pipes):
+        if len(remaining_points) < min_samples:
+            break
+
+        dir_vec = np.mean(remaining_dirs, axis=0)
+        # dir_vec = remaining_dirs[max_dir_id]
+        result = fit_line_ransac_dir_radius(remaining_points, dir_vec=dir_vec,min_samples=min_samples,radius=remaining_radii,
+                                     ratio=residual_threshold,
+                                     max_trials=max_trials,seed=1)# modify yw: dir_vec=np.mean(remaining_dirs, axis=0),
+        if result is None:
+            break
+
+        start, end, direction, inliers = result
+
+        # 获取全局索引（关键修正点）
+        global_inliers = remaining_indices[inliers]
+        inlier_points = points[global_inliers]  # 直接映射到原始点云
+        inlier_dirs = directions[global_inliers] if directions is not None else None
+        inlier_radii = radii[global_inliers] if radii is not None else None
+        inlier_surf = surf[global_inliers] if surf is not None else None
+        radius = np.mean(inlier_radii)
+
+        # 20250926, mcwei, return more infos for visualization.
+        ind_inlier = global_inliers
+        pipes.append((
+            start, end, direction,radius,
+            inlier_points, inlier_radii, inlier_dirs,inlier_surf,
+            ind_inlier,  # the indices of inlier points.
+        ))
+
+        # 更新剩余点集（通过布尔掩码）
+        mask = np.ones(len(remaining_points), dtype=bool)
+        mask[inliers] = False
+        remaining_points = remaining_points[mask]
+        remaining_indices = remaining_indices[mask]
+        if remaining_dirs is not None:
+            remaining_dirs = remaining_dirs[mask]
+        if remaining_radii is not None:
+            remaining_radii = remaining_radii[mask]
+        if remaining_surf is not None:
+            remaining_surf = remaining_surf[mask]
+
+    return pipes
+class PipeSegment:
+    '''得到中心线start，end，r'''
+    def __init__(self, segment_points, segment_radii, segment_dirs,segment_surf=None):
+        self.raw_points = segment_points
+        self.input_radii = segment_radii
+        self.directions = segment_dirs
+        self.surf = segment_surf
+        self.centerline_start = None
+        self.centerline_end = None
+        self.direction = None
+        self.radius = None
+        # self.fit_cylinder()
+        self.fit_cylinder_optimized()
+
+    def fit_cylinder(self):
+        start, end, direction, radius = fit_cylinder_with_custom_ransac(
+            self.raw_points, self.input_radii, self.directions)
+        self.centerline_start = start
+        self.centerline_end = end
+        self.direction = direction
+        self.radius = radius
+    def fit_cylinder_optimized(self):
+        pipes_data = detect_multiple_pipes(
+            self.raw_points, self.directions, self.input_radii, self.surf,
+            max_pipes=1,
+            min_samples_ratio=0.1,
+            min_samples=30,
+            residual_threshold=0.05
+        )
+        if len(pipes_data) == 0:
+            return None
+        pipes_data=pipes_data[0]
+        # 将每条管道转换为PipesSegment对象
+        # start, end, direction, radius = fit_cylinder_with_custom_ransac(
+        #     self.raw_points, self.input_radii, self.directions)
+        self.centerline_start = pipes_data[0]
+        self.centerline_end = pipes_data[1]
+        self.direction = pipes_data[2]
+        self.radius = pipes_data[3]
+class PipesSegment:
+    """单根管道的几何属性（中心线起点、终点、方向、半径）"""
+    # 20250926, mcwei, return more infos for visualization.
+    def __init__(self, centerline_start, centerline_end, direction, radius, inlier_points,inlier_radii,inlier_dirs,inlier_surf, ind_inlier, lst_id_cluster):
+        self.centerline_start = centerline_start  # 起点坐标 [x,y,z]
+        self.centerline_end = centerline_end      # 终点坐标 [x,y,z]
+        self.direction = direction                # 方向向量 [dx,dy,dz]
+        self.radius = radius                      # 管道半径
+        self.raw_points = inlier_points              # 可选：关联的原始点云数据
+        self.input_radii = inlier_radii
+        self.directions = inlier_dirs
+        self.surf = inlier_surf
+
+        # 20250926, mcwei, return more infos for visualization.
+        self.ind_inlier = ind_inlier  # the indices of inlier points.
+        self.ind_clustered = None  # the indices of clustered points.
+        self.lst_id_cluster = lst_id_cluster  # ids of the related cluster.
+
+    @property
+    def length(self):
+        """计算管道长度"""
+        return np.linalg.norm(self.centerline_end - self.centerline_start)
+class PipeSegments:
+    """一个点云分段中检测到的所有管道"""
+    def __init__(self, segment_points, segment_radii, segment_dirs,segment_surf):
+        self.raw_points = segment_points  # 原始点云坐标
+        self.input_radii = segment_radii  # 点云半径
+        self.directions = segment_dirs    # 点云方向
+        self.surf = segment_surf
+        self.pipes = []                   # 存储多个PipesSegment实例
+        self._fit_cylinders()
+
+    def _fit_cylinders(self):
+        pipes_data = detect_multiple_pipes(
+            self.raw_points, self.directions, self.input_radii,self.surf,
+            max_pipes=1,#5
+            min_samples_ratio=0.2, # 0.2
+            min_samples=0,# 1500
+            residual_threshold=0.05
+        )
+        # 将每条管道转换为PipesSegment对象
+        # 20250926, mcwei, return more infos for visualization.
+        self.pipes = [
+            PipesSegment(
+                centerline_start=start,
+                centerline_end=end,
+                direction=dir,
+                radius=radius,
+                inlier_points=inlier_points,  # 可选传递原始点云
+                inlier_radii=inlier_radii,
+                inlier_dirs = inlier_dirs,
+                inlier_surf = inlier_surf,
+                ind_inlier=ind_inlier,  # the indices of inlier points.
+                lst_id_cluster=[i],  # ids of the related cluster.
+            ) for i, (start, end, dir, radius,inlier_points,inlier_radii,inlier_dirs,inlier_surf, ind_inlier) in enumerate(pipes_data)
+        ]
+    def __iter__(self):
+        """支持迭代遍历管道"""
+        return iter(self.pipes)
+
+    def __len__(self):
+        """返回管道数量"""
+        return len(self.pipes)
+
+    def filter_by_radius(self, min_radius):
+        """过滤半径过小的管道"""
+        self.pipes = [p for p in self.pipes if p.radius >= min_radius]
+def extract_segments(points, radii, dirs, labels,surf=None):
+    segments = []
+    labels_seg = []
+    for label in np.unique(labels):
+        if label == -1:
+            continue
+        if label == 162:
+            print(label)
+        mask = labels == label
+        seg_points = points[mask]
+        seg_radii = radii[mask]
+        seg_dirs = dirs[mask]
+        seg_surf = surf[mask]
+        # if len(seg_points) < 5:
+        #     continue
 
 
-def clip_gt(gt, xyz, margin=.05):
-    mn = xyz.min(0) - margin
-    mx = xyz.max(0) + margin
-    out = []
-    for g in gt:
-        res = _clip(np.asarray(g['start']), np.asarray(g['end']), mn, mx)
-        if res is None: continue
-        s, e = res
-        out.append({'start': s, 'end': e, 'radius': g['radius']})
-    return out
+        # segment = PipeSegment(seg_points, seg_radii, seg_dirs)
+        # segments.append(segment)
+        segment = PipeSegments(seg_points, seg_radii, seg_dirs,seg_surf).pipes
+        for i in segment:
+            if i == None:
+                continue
 
+            # 20250926, mcwei, return more infos for visualization.
+            i.ind_clustered = mask.nonzero()[0]
+            i.ind_inlier = i.ind_clustered[i.ind_inlier]
 
-# ───────────────────── 5. matching & metrics ───────────────────
+            segments.append(i)
+            labels_seg.append(label)
+    return segments,labels_seg
 
-def _ang(u, v):
-    u = u / np.linalg.norm(u)
-    v = v / np.linalg.norm(v)
-    return np.degrees(np.arccos(np.clip(np.dot(u, v), -1, 1)))
-
-
-def _dist(a: dict, b: dict) -> float:
+def _dist(a, b) -> float:
     """Shortest distance between two finite line segments (a and b).
 
     Uses the algorithm for the closest distance between two segments in 3‑D.
     Returns **one scalar distance** in metres.
     """
-    p, q = a['start'], b['start']
-    u, v = a['end'] - a['start'], b['end'] - b['start']
+    p, q = a.centerline_start, b.centerline_start
+    u, v = a.centerline_end - a.centerline_start, b.centerline_end - b.centerline_start
     w0 = p - q
 
     a_len = np.dot(u, u)
@@ -402,275 +911,215 @@ def _dist(a: dict, b: dict) -> float:
     closest_a = p + s * u
     closest_b = q + t * v
     return float(np.linalg.norm(closest_a - closest_b))
+def refine_centerline_segments_with_direction(segments, angle_threshold=np.deg2rad(10), distance_threshold=0.2,radius_threshold=0.2,line_distance_threshold=0.05):
+    # distance_threshold重要
+    refined = []
+    used = set()
+
+    def angle_between(v1, v2):
+        v1 = v1 / (np.linalg.norm(v1) + 1e-6)
+        v2 = v2 / (np.linalg.norm(v2) + 1e-6)
+        return np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0)) # modify yw: direction
+
+    def radius_between(r1, r2):
+        return abs(r1 - r2) <= radius_threshold
+
+    def line_to_line_distance(seg1, seg2):
+        p1 = seg1.centerline_start  # 直线1上的点
+        d1 = seg1.direction  # 直线1的方向向量
+        p2 = seg2.centerline_start  # 直线2上的点
+        d2 = seg2.direction  # 直线2的方向向量
+
+        cross = np.cross(d1, d2)
+        if np.linalg.norm(cross) < 1e-6:  # 平行直线
+            # 计算点到直线的距离
+            return np.linalg.norm(np.cross(d1, p2 - p1)) / np.linalg.norm(d1)
+        else:  # 不平行直线
+            return np.abs(np.dot(p2 - p1, cross)) / np.linalg.norm(cross)
+    for i, seg_i in enumerate(segments):
+        if i in used:
+            continue
+        merged_indices = [i]
+        for j, seg_j in enumerate(segments):
+            if j <= i or j in used:
+                continue
+            if angle_between(seg_i.direction, seg_j.direction) > angle_threshold:
+                continue
+            if not radius_between(seg_i.radius, seg_j.radius):
+                continue
+            # 条件3：直线距离 ≤ line_distance_threshold（新增严格约束）
+            if line_to_line_distance(seg_i, seg_j) > line_distance_threshold:
+            # if line_to_line_distance(seg_i, seg_j) > 1.2*max(abs(seg_i.radius), abs(seg_j.radius)):
+                continue
+            ed = _dist(seg_i, seg_j)
+            # endpoints_i = [seg_i.centerline_start, seg_i.centerline_end]
+            # endpoints_j = [seg_j.centerline_start, seg_j.centerline_end]
+            # ed = min(np.linalg.norm(p1 - p2) for p1 in endpoints_i for p2 in endpoints_j)
+            if ed < distance_threshold:
+                merged_indices.append(j)
+        if len(merged_indices) == 1:
+            refined.append(seg_i)
+        else:
+            merged_points = np.concatenate([segments[k].raw_points for k in merged_indices], axis=0)
+            merged_radii = np.concatenate([segments[k].input_radii for k in merged_indices], axis=0)
+            merged_dirs = np.concatenate([segments[k].directions for k in merged_indices], axis=0)
+            merged_surf = np.concatenate([segments[k].surf for k in merged_indices], axis=0)
+            merged_segment = PipeSegment(merged_points, merged_radii, merged_dirs,merged_surf)
+            # merged_segment = PipeSegments(merged_points, merged_radii, merged_dirs, merged_surf).pipes
+            if merged_segment is None:
+                refined.extend(segments[k] for k in merged_indices)
+            else:
+                refined.append(merged_segment)
+        used.update(merged_indices)
+    return refined
+
+def filter_segments(segments, min_length=0.01, min_radius=0.001, max_radius=2.0,
+                    min_density=50, min_aspect_ratio=0.5):
+    filtered = []
+    raw_radius=[]
+    refined_radius=[]
+    for i,seg in enumerate(segments):
+        length = np.linalg.norm(seg.centerline_end - seg.centerline_start)
+        radius = seg.radius
+        volume = np.pi * (radius ** 2) * max(length, 1e-6)
+        density = len(seg.raw_points) / volume if volume > 0 else 0
+        aspect_ratio = length / (2 * radius) if radius > 0 else 0
+
+        if length < min_length:
+            continue
+        if not (min_radius <= radius <= max_radius):
+            continue
+
+        # Least-squares circle fitting in 2D projection for refined radius
+        # project points orthogonal to centerline direction
+        raw_radius.append(radius)
+        d = seg.direction / (np.linalg.norm(seg.direction) + 1e-6)
+        v = seg.surf - seg.centerline_start
+        t = np.dot(v, d)
+        proj = seg.centerline_start + np.outer(t, d)
+        orth = seg.surf - proj
+        norms = np.linalg.norm(orth, axis=1)
+        refined_radii = np.mean(norms)
+        seg.radius = refined_radii
+        refined_radius.append(refined_radii)
+        filtered.append(seg)
+    return filtered,raw_radius,refined_radius
+
+def flatten_segments(segments):
+    centerline = []
+    radii = []
+    for seg in segments:
+        centerline.append(seg.centerline_start)
+        centerline.append(seg.centerline_end)
+        radii.append(seg.radius)
+        radii.append(seg.radius)
+    return np.array(centerline), np.array(radii)
 
 
-# ───────────────────── 5b. many‑to‑many matching ───────────────────
-
-def match(pred: List[dict], gt: List[dict], dt=0.1, at=30, rr=0.25):
-    """Many‑to‑many: every pred–GT pair passing thresholds is a hit."""
-    matches = []
-    pred_hit = [False] * len(pred)
-    gt_hit = [False] * len(gt)
-    for pi, p in enumerate(pred):
-        for gi, g in enumerate(gt):
-            # print('Here:',p['radius'],g['radius'])
-            # if abs(p['radius']-g['radius'])/(g['radius']+1e-6)>rr: continue
-            if _ang(p['end'] - p['start'], g['end'] - g['start']) > at: continue
-            if _dist(p, g) > dt: continue
-            matches.append((pi, gi))
-            pred_hit[pi] = True
-            gt_hit[gi] = True
-    un_pred = [i for i, ok in enumerate(pred_hit) if not ok]
-    un_gt = [i for i, ok in enumerate(gt_hit) if not ok]
-    return matches, un_pred, un_gt
-
-
-# ───────────────────── 5c. metrics ───────────────────
-
-def metrics(pred, gt, m):
-    tp = len(set(i for i, _ in m))
-    fp = len(pred) - tp
-    fn = len(gt) - len(set(j for _, j in m))
-    prec = tp / (tp + fp + 1e-8)
-    rec = tp / (tp + fn + 1e-8)
-    f1 = 2 * prec * rec / (prec + rec + 1e-8)
-    if tp:
-        dist = np.mean([_dist(pred[i], gt[j]) for i, j in m])
-        ang = np.mean([_ang(pred[i]['end'] - pred[i]['start'], gt[j]['end'] - gt[j]['start']) for i, j in m])
-        rad = np.mean([abs(pred[i]['radius'] - gt[j]['radius']) for i, j in m])
-    else:
-        dist = ang = rad = float('nan')
-    tl = sum(np.linalg.norm(g['end'] - g['start']) for g in gt)
-    ml = sum(np.linalg.norm(gt[j]['end'] - gt[j]['start']) for _, j in m)
-
-    pred_len = sum(np.linalg.norm(p['end'] - p['start']) for p in pred)
-    # 这里似乎写错了，应该是j,_ in m,已经修改
-    match_len = sum(np.linalg.norm(pred[j]['end'] - pred[j]['start']) for j, _ in m)
-
-    return {'precision': prec, 'recall': rec, 'f1': f1, 'mean_end_dist': dist, 'mean_ang_deg': ang, 'mean_rad_err': rad,
-            'completeness': ml / (tl + 1e-8), 'len_precision': match_len / (pred_len + 1e-8), 'tp': tp, 'fp': fp,
-            'fn': fn}
-
-
-# ───────────────────── 6. visualisation ───────────────────
-
-def _set_axes_equal(ax):
-    """Make 3‑D axes have equal scale so that spheres appear as spheres.
-    Matplotlib trick: match the range on all 3 axes."""
-    x_limits = ax.get_xlim3d()
-    y_limits = ax.get_ylim3d()
-    z_limits = ax.get_zlim3d()
-    ranges = np.array([x_limits[1] - x_limits[0], y_limits[1] - y_limits[0], z_limits[1] - z_limits[0]])
-    centers = np.array([np.mean(x_limits), np.mean(y_limits), np.mean(z_limits)])
-    radius = 0.5 * ranges.max()
-    ax.set_xlim3d([centers[0] - radius, centers[0] + radius])
-    ax.set_ylim3d([centers[1] - radius, centers[1] + radius])
-    ax.set_zlim3d([centers[2] - radius, centers[2] + radius])
-
-
-def vis_roi(pred, gt, matches, out):
-    """Visualize ROI‑clipped GT vs. prediction **with pair annotations**.
-
-    * GT  : gray lines (unmatched) / green (matched)
-    * Pred: red  lines (FP)       / green (TP)
-    * Each (pred, GT) match is connected by a dashed blue line and labelled
-      with an integer ID so you can quickly inspect which segments correspond.
-    """
-    fig = plt.figure(figsize=(12, 9))
+def visualize_segments(segments, labels=None, original_points=None, surface_points=None, save_path="segments.png"):
+    from matplotlib import cm
+    fig = plt.figure(figsize=(20,16))
     ax = fig.add_subplot(111, projection='3d')
 
-    # 显示范围一样 改
-    # 1) Collect all points to compute global bounds
-    all_points = []
-    for g in gt:
-        all_points.append(g['start'])
-        all_points.append(g['end'])
-    for p in pred:
-        all_points.append(p['start'])
-        all_points.append(p['end'])
-    all_points = np.array(all_points)
+    colors = cm.rainbow(np.linspace(0, 1, len(segments)))
+    if surface_points is not None:
+        ax.scatter(surface_points[:, 0], surface_points[:, 1], surface_points[:, 2],
+                   s=0.1, alpha=0.1, color=[0.2, 0.2, 0.2], label=f"Cluster(surface)")
+    if original_points is not None and labels is not None:
+        unique_labels = np.unique(labels)
+        cmap = plt.colormaps['rainbow'].resampled(len(unique_labels))
 
-    # 2) Compute unified axis limits (same for X/Y/Z)
-    min_val = np.min(all_points)
-    max_val = np.max(all_points)
-    padding = 0.1 * (max_val - min_val)  # 10% padding
+        for idx, label in enumerate(unique_labels):
+            if label == -1:
+            mask = labels == label
+            cluster_points = original_points[mask]
+            color = cmap(idx)
+            ax.scatter(cluster_points[:, 0], cluster_points[:, 1], cluster_points[:, 2],
+                       s=0.05, alpha=0.5, color=color, label=f"Cluster {label} (centerline)")
+            # id
+            mid = np.mean(cluster_points, axis=0)
+            ax.text(mid[0], mid[1], mid[2], str(label),
+                    color='black',  # 选择与背景对比度高的颜色
+                    fontsize=6, ha='center', va='center')
 
-    ax.set_xlim(min_val - padding, max_val + padding)
-    ax.set_ylim(min_val - padding, max_val + padding)
-    ax.set_zlim(min_val - padding, max_val + padding)
+    for i, seg in enumerate(segments):
+        color = colors[i]
+        # draw centerline
+        ax.plot([seg.centerline_start[0], seg.centerline_end[0]],
+                [seg.centerline_start[1], seg.centerline_end[1]],
+                [seg.centerline_start[2], seg.centerline_end[2]],
+                color=color, linewidth=0.5)
 
-    # 3) Force equal aspect ratio (unit length一致)
-    ax.set_box_aspect([1, 1, 1])  # X:Y:Z = 1:1:1
+        # draw radius line at midpoint orthogonal to direction
+        mid = (seg.centerline_start + seg.centerline_end) / 2
+        # id
+        ax.text(mid[0], mid[1], mid[2], str(i), color='black',
+                fontsize=2, ha='center', va='center',
+                bbox=dict(facecolor='white', alpha=0.4, edgecolor='none', pad=0.3))
+        d = seg.direction / (np.linalg.norm(seg.direction) + 1e-6)
+        if np.allclose(d, [0, 0, 1]):
+            ortho = np.array([1, 0, 0])
+        else:
+            ortho = np.cross(d, [0, 0, 1])
+            ortho /= np.linalg.norm(ortho)
+        r_start = mid - seg.radius * ortho
+        r_end = mid + seg.radius * ortho
+        ax.plot([r_start[0], r_end[0]], [r_start[1], r_end[1]], [r_start[2], r_end[2]],
+                color=color, linewidth=0.3, alpha=0.8)
+    # 获取所有数据的整体范围,设置坐标轴范围
+    all_points = np.concatenate([seg.centerline_start.reshape(1, 3) for seg in segments] +
+                                [seg.centerline_end.reshape(1, 3) for seg in segments])
+    if original_points is not None:
+        all_points = np.vstack([all_points, original_points])
+    min_val = np.min(all_points, axis=0)
+    max_val = np.max(all_points, axis=0)
+    max_range = max(max_val - min_val)  # 取最大跨度
 
-    matched_pred = {pi for pi, _ in matches}
-    matched_gt = {gi for _, gi in matches}
+    # 设置各轴范围（中心对齐）
+    mid = (min_val + max_val) * 0.5
+    ax.set_xlim(mid[0] - max_range / 2, mid[0] + max_range / 2)
+    ax.set_ylim(mid[1] - max_range / 2, mid[1] + max_range / 2)
+    ax.set_zlim(mid[2] - max_range / 2, mid[2] + max_range / 2)
 
-    # 1) Plot GT segments first (so they appear behind predictions)
-    for gi, g in enumerate(gt):
-        col = 'limegreen' if gi in matched_gt else 'gray'
-        ax.plot([g['start'][0], g['end'][0]],
-                [g['start'][1], g['end'][1]],
-                [g['start'][2], g['end'][2]],
-                color=col, linewidth=0.3, alpha=0.8)
-
-    # 2) Plot predicted segments
-    for pi, p in enumerate(pred):
-        col = 'green' if pi in matched_pred else 'red'
-        ls = '-' if col == 'green' else '-'
-        ax.plot([p['start'][0], p['end'][0]],
-                [p['start'][1], p['end'][1]],
-                [p['start'][2], p['end'][2]],
-                color=col, linestyle=ls, linewidth=0.3, alpha=0.9)
-
-    # 3) Annotate each matched pair with an ID and a dashed connector
-    for idx, (pi, gi) in enumerate(matches, 1):
-        p_mid = 0.5 * (pred[pi]['start'] + pred[pi]['end'])
-        g_mid = 0.5 * (gt[gi]['start'] + gt[gi]['end'])
-        ax.plot([p_mid[0], g_mid[0]],
-                [p_mid[1], g_mid[1]],
-                [p_mid[2], g_mid[2]],
-                color='blue', linestyle=':', linewidth=1, alpha=0.6)
-        # place text slightly offset from GT midpoint to avoid overlap
-        # ax.text(g_mid[0], g_mid[1], g_mid[2], str(idx), color='blue', fontsize=9)
-
-    ax.set_title('GT (gray) • TP (green) • FP (red) • blue lines = matches')
+    ax.set_title("Fitted Segments with Centerlines and Points")
     plt.tight_layout()
-    plt.savefig(out, dpi=300)
-    plt.close(fig)
+    plt.savefig(save_path, dpi=300)
+    print(f"[Saved] {save_path}")
 
 
-def vis_raw(gt_raw, xyz, out, max_pts=80000):
-    fig = plt.figure(figsize=(12, 9))
-    ax = fig.add_subplot(111, projection='3d')
-    if len(xyz) > max_pts: xyz = xyz[np.random.choice(len(xyz), max_pts, replace=False)]
-    ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], s=1, alpha=.05, c='skyblue')
-    for g in gt_raw:
-        ax.plot([g['start'][0], g['end'][0]], [g['start'][1], g['end'][1]], [g['start'][2], g['end'][2]], c='black',
-                lw=1)
-    ax.set_title('Original GT + full cloud')
-    plt.tight_layout()
-    plt.savefig(out, dpi=300)
-    plt.close(fig)
+def evaluate_radius_estimation(raw_radius, new_radius, threshold_ratio=0.2):
+    raw_radius = np.asarray(raw_radius)
+    new_radius = np.asarray(new_radius)
+    raw_radius[raw_radius==0] = 1e-6
+    new_radius[new_radius==0] = 1e-6
+
+    assert len(raw_radius) == len(new_radius), "Inputs must have the same length!"
+
+    abs_errors = np.abs(new_radius - raw_radius)/raw_radius
+    mean_error = np.mean(abs_errors)
+
+    correct = np.sum(abs_errors < threshold_ratio)
+    accuracy = (correct / len(raw_radius)) * 100  # 百分比
+
+    return mean_error, accuracy
+
+def main(input_txt):
+    if '.npy' in input_txt:
+        centerline_points, pipe_radii, surface_points, pipe_dirs = load_np_data(input_txt)
+    if '.txt' in input_txt:
+        centerline_points, pipe_radii, surface_points, pipe_dirs,offset = load_txt_data(input_txt)
+    if '.pts' in input_txt:
+        centerline_points, pipe_radii, surface_points, pipe_dirs = load_pts_data(input_txt)
+    labels = region_growing_with_direction(centerline_points, pipe_dirs)
+    segments = extract_segments(centerline_points, pipe_radii, pipe_dirs, labels)
+    visualize_segments(segments, labels, centerline_points, surface_points=surface_points, save_path="step1_segmented_centerline.png")
+    visualize_segments(segments,  save_path="step2_segments_ransac.png")
+    segments = refine_centerline_segments_with_direction(segments)
+    segments = filter_segments(segments)
+    visualize_segments(segments, None, centerline_points,  save_path="step3_segments_refined.png")
+    centerline, radii = flatten_segments(segments)
+    print("[Done] Final centerline segments:", len(centerline) // 2)
 
 
-# ───────────────────── 7. main CLI ───────────────────
-
-def to_native(seg):
-    return {
-        "ID": seg.get("ID", ""),
-        "start": np.asarray(seg["start"]).tolist(),
-        "end": np.asarray(seg["end"]).tolist(),
-        "radius": float(seg["radius"]),
-    }
-
-
-def proc(file):
-    seed_torch(20251020)
-    results_path = os.path.dirname(file)
-    out = os.path.join(results_path, saved_name)
-    # file,out = args['file'], args['out']
-    os.makedirs(out, exist_ok=True)
-    file_name = file.split('/')[-1]
-    try:
-        pred_arr, offset, radius_mean_error = generate_pred(file, out)
-        if not isinstance(pred_arr, np.ndarray):
-            radius_mean_error = -1
-            return radius_mean_error
-        pred_arr[:, :3] += offset
-        # np.save(os.path.join(out, 'pred.npy'), pred_arr)
-        pred = [{'start': pred_arr[2 * i, :3], 'end': pred_arr[2 * i + 1, :3], 'radius': float(pred_arr[2 * i, 3])} for
-                i in
-                range(pred_arr.shape[0] // 2)]
-        pred_json = [
-            {
-                'id': i,
-                'start': pred_arr[2 * i, :3].tolist(),  # 将 NumPy 数组转为 Python 列表
-                'end': pred_arr[2 * i + 1, :3].tolist(),
-                'radius': float(pred_arr[2 * i, 3])
-            }
-            for i in range(pred_arr.shape[0] // 2)
-        ]
-        # 保存为 JSON 文件
-        json_path = os.path.join(out, f'{file_name}.json')
-        with open(json_path, 'w') as f:
-            json.dump(pred_json, f, indent=4)
-    except:
-        print(file)
-        json_path = os.path.join(out, f'{file_name}.json')
-        pred_json = [{}],
-        with open(json_path, 'w') as f:
-            json.dump(pred_json, f, indent=4)
-        radius_mean_error = -1
-        pass
-        '''
-        xyz = load_xyz(args.cloud)
-        gt_raw = load_gt(args.gt)
-        gt = clip_gt(gt_raw, xyz)
-
-        with open(os.path.join(args.out, "clipped_gt.json"), "w", encoding="utf-8") as f:
-            json.dump([to_native(s) for s in gt], f, indent=2)
-        m, up, ug = match(pred, gt, dt=args.dt, at=args.at, rr=args.rr)
-        met = metrics(pred, gt, m)
-        json.dump(met, open(os.path.join(args.out, 'metrics.json'), 'w'), indent=2)
-        pred = [{'start': i['start'] - offset, 'end': i['end'] - offset, 'radius': i['radius']} for i in pred]
-        gt = [{'start': i['start'] - offset, 'end': i['end'] - offset, 'radius': i['radius']} for i in gt]
-
-        vis_roi(pred, gt, m, os.path.join(args.out, 'vis.png'))
-        vis_raw(gt_raw, xyz, os.path.join(args.out, 'raw_gt.png'))
-
-        with open(os.path.join(args.out, 'summary.txt'), 'w', encoding='utf-8') as f:
-            f.write('Metrics ')
-            f.write(json.dumps(met, indent=2))
-            f.write('Predicted segments:')
-            for i in range(pred_arr.shape[0] // 2):
-                s = pred_arr[2 * i]
-                e = pred_arr[2 * i + 1]
-                r = s[3]
-                f.write(f'{s[0]:.3f},{s[1]:.3f},{s[2]:.3f} -> {e[0]:.3f},{e[1]:.3f},{e[2]:.3f}, r={r:.4f}')
-        '''
-    return radius_mean_error
-
-
-# if __name__ == '__main__':
-#     pa = argparse.ArgumentParser('evaluate PipeNet')
-#     pa.add_argument('--cloud', required=True)
-#     pa.add_argument('--gt', required=False)
-#     pa.add_argument('--out', default='eval_results')
-#     pa.add_argument('--dt', type=float, default=0.05)
-#     pa.add_argument('--at', type=float, default=10)
-#     pa.add_argument('--rr', type=float, default=0.25)
-#     pa.add_argument('--central', action='store_true', default=False)
-#     args = pa.parse_args()
-#     os.makedirs(args.out, exist_ok=True)
-#     #  --cloud 2x2_2y2_4z1_GlobalId_data/select_pipe_cloud.txt
-#     # --gt 2x2_2y2_4z1_GlobalId_data/select_pipe_GT.txt
-#     # --out 2x2_2y2_4z1_GlobalId_result
-#     main(args)
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='evaluation')
-    parser.add_argument('--results_path',
-                        default='/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1',
-                        # 'exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1',
-                        # default="/media/34.92/common-data-2t/data_tmp",
-                        type=str, help='path to checkpoint')
-    args = parser.parse_args()
-    results_path = args.results_path
-    files = glob.glob(os.path.join(results_path, "*.pts"))
-    # files = ['exp/NRDK/baseline_s2/result/block_1Ftest_10_3_1.pts']
-    # files = files[:20]
-    seed_torch(20251020)
-    multi_proc = True
-    r_list = []
-    if multi_proc:
-        with Pool(32) as p:
-            r_list = list(tqdm(p.imap(proc, files), total=len(files)))
-    else:
-        for file in tqdm(files):
-            r_list.append(proc(file))
-    r_list = np.array(r_list)
-    r_list = r_list[r_list != -1]
-    print(f"RED={r_list.mean() * 100}%")
-
-    # files = glob.glob(os.path.join(results_path, 'cylinder_fitting', "*.json"))
+if __name__ == "__main__":
+    main("block_0_11P_0425.pts")
