@@ -1,25 +1,24 @@
+def centralize_data(data, central=True):
+    """
+    将点云数据中心化（减去均值）并记录偏移量
+    参数:
+        data: 点云数据，形状为 (N, 3+) 的 NumPy 数组，前3列必须是 [x, y, z]
+        central: 是否执行中心化
+    返回:
+        data_centralized: 中心化后的数据（如果 central=False 则返回原数据）
+        offset: 三个方向的偏移量 [x_offset, y_offset, z_offset]
+    """
+    if not central:
+        return data, np.zeros(3)  # 不中心化时返回原数据和零偏移
 
-    # -------------------------------------------------------
-    #  在 generate_pred 内保存每个 cluster 的点（保存 PLY）
-    # -------------------------------------------------------
-    save_cluster_root = os.path.join(out_dir, "save_for_cluster")
-    os.makedirs(save_cluster_root, exist_ok=True)
+    # 提取前3列坐标（x, y, z）
+    xyz = data[:, :3]
 
-    block_name = cloud.split('/')[-1].split('.')[0]
-    save_block_dir = os.path.join(save_cluster_root, block_name)
-    os.makedirs(save_block_dir, exist_ok=True)
+    # 计算各方向的均值（偏移量）
+    offset = np.mean(xyz, axis=0)
 
-    unique_labels = np.unique(lbl)
-    valid_labels = unique_labels[unique_labels >= 0]
+    # 中心化：减去偏移量
+    data_centralized = data.copy()
+    data_centralized[:, :3] = xyz - offset
 
-    for lb in valid_labels:
-        pts = surf[lbl == lb]  # cluster 点
-        ply_path = os.path.join(save_block_dir, f"{lb}.ply")
-
-        # 颜色设置：使用已有的 LST_COLOR 或纯色
-        if pts.shape[0] > 0:
-            colors = np.ones((pts.shape[0], 3)) * (lb * 37 % 255 / 255.0)  # 默认颜色
-        else:
-            colors = None
-
-        save_ply(pts, ply_path, colors=colors)
+    return data_centralized, offset
