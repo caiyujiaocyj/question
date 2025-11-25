@@ -1,1 +1,14 @@
 
+def export_single_seg_to_ifc(seg, ifc_out_path, seg_id=0):
+    """
+    seg: 一个 PipesSegment / PipeSegment 对象
+    """
+    cylinders = [{
+        "id": seg_id,
+        "start": seg.centerline_start,
+        "end":   seg.centerline_end,
+        "radius": float(seg.radius),
+        "confidence": 1.0,
+    }]
+
+    create_ifc_file(cylinders, ifc_out_path)
