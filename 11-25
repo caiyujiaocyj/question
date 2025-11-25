@@ -1,24 +1,147 @@
-def centralize_data(data, central=True):
+import numpy as np
+import pickle
+import os
+from pipe_function import (
+    PipesSegment, 
+    extract_segments, 
+    dir_est,
+    region_growing_with_direction,
+    hierarchical_region_growing,
+    filter_segments,
+    flatten_segments
+)
+from run import dir_reg2cls
+import argparse
+
+def fit_cylinder_consistent(cluster_file, output_dir=None):
     """
-    将点云数据中心化（减去均值）并记录偏移量
+    完全按照原始代码流程拟合圆柱体
+    
     参数:
-        data: 点云数据，形状为 (N, 3+) 的 NumPy 数组，前3列必须是 [x, y, z]
-        central: 是否执行中心化
+        cluster_file: cluster点云的npy文件路径
+        output_dir: 输出目录(可选)
+    
     返回:
-        data_centralized: 中心化后的数据（如果 central=False 则返回原数据）
-        offset: 三个方向的偏移量 [x_offset, y_offset, z_offset]
+        cylinder_params: 拟合的圆柱体参数(与原始代码完全一致)
     """
-    if not central:
-        return data, np.zeros(3)  # 不中心化时返回原数据和零偏移
+    # 1. 加载数据并模拟原始输入结构
+    surf = np.load(cluster_file)[:, :3]  # 确保只有XYZ坐标
+    
+    if len(surf) < 10:  # 原始代码要求的最小点数
+        print(f"警告: 点数量不足({len(surf)}), 至少需要10个点")
+        return None
+    
+    # 2. 模拟原始数据结构
+    c = surf.copy()  # 中心线候选点(原始代码中通过surf和r计算得到)
+    r = np.ones(len(surf)) * 0.05  # 初始半径估计(与原始训练一致)
+    d = np.tile([0, 0, 1], (len(surf), 1))  # 初始方向估计
+    
+    # 3. 完全复制原始处理流程 -------------------------
+    
+    # 3.1 方向分类(与原始代码完全一致)
+    d = dir_reg2cls(d)
+    
+    # 3.2 初始聚类(使用与原始代码相同的参数)
+    lbl = region_growing_with_direction(c, d, radius=0.02)
+    if len(np.unique(lbl)) == 1:  # 如果聚类失败
+        lbl = np.zeros(len(c), dtype=int)
+    
+    # 3.3 层次化区域生长(相同参数)
+    lbl = hierarchical_region_growing(c, d, lbl, radius=0.1, min_points=5)
+    
+    # 3.4 重新估计方向(使用表面法线)
+    sur_normals = estimate_normals(surf)  # 使用PCA估计法线
+    d = dir_est(sur_normals, lbl)
+    d = dir_reg2cls(d)  # 再次方向分类
+    
+    # 3.5 提取圆柱体段(相同参数)
+    segs, labels = extract_segments(c, r, d, lbl, surf)
+    
+    # 3.6 过滤圆柱体段(相同逻辑)
+    segs, raw_radius, new_radius = filter_segments(segs)
+    
+    if not segs:
+        print("警告: 未能拟合出圆柱体")
+        return None
+    
+    # 4. 提取结果 -----------------------------------
+    cylinder = segs[0]  # 取第一个(也是唯一一个)圆柱体
+    
+    # 与原始代码完全相同的输出结构
+    cylinder_params = {
+        'start': cylinder.centerline_start,
+        'end': cylinder.centerline_end,
+        'radius': cylinder.radius,
+        'length': cylinder.length,
+        'direction': cylinder.direction,
+        'num_points': len(cylinder.raw_points),
+        'inlier_indices': cylinder.ind_inlier,
+        'cluster_indices': cylinder.ind_clustered
+    }
+    
+    # 5. 保存结果(可选) ------------------------------
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 保存与原始代码相同格式的结果
+        pred_arr = flatten_segments(segs)
+        np.save(os.path.join(output_dir, 'pred.npy'), pred_arr)
+        
+        # 保存详细参数
+        output_file = os.path.join(output_dir, 
+                                 os.path.basename(cluster_file).replace('.npy', '_cylinder.pkl'))
+        with open(output_file, 'wb') as f:
+            pickle.dump({
+                'params': cylinder_params,
+                'points': surf,
+                'direction_vectors': d,
+                'normals': sur_normals,
+                'labels': lbl
+            }, f)
+        print(f"结果已保存到: {output_file}")
+    
+    return cylinder_params
 
-    # 提取前3列坐标（x, y, z）
-    xyz = data[:, :3]
+def estimate_normals(points, k=10):
+    """使用PCA估计法线(与原始代码相同方法)"""
+    from sklearn.decomposition import PCA
+    from sklearn.neighbors import NearestNeighbors
+    
+    if len(points) < k:
+        k = len(points)
+    
+    nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(points)
+    _, indices = nbrs.kneighbors(points)
+    
+    normals = np.zeros((len(points), 3))
+    pca = PCA(n_components=3)
+    
+    for i in range(len(points)):
+        neighbors = points[indices[i]]
+        pca.fit(neighbors)
+        normal = pca.components_[2]  # 最小特征值对应的向量
+        normals[i] = normal
+    
+    return normals
 
-    # 计算各方向的均值（偏移量）
-    offset = np.mean(xyz, axis=0)
-
-    # 中心化：减去偏移量
-    data_centralized = data.copy()
-    data_centralized[:, :3] = xyz - offset
-
-    return data_centralized, offset
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='完全按照原始流程拟合圆柱体')
+    parser.add_argument('--cluster', required=True, help='cluster点云的npy文件路径')
+    parser.add_argument('--out', default='./cylinder_output', help='输出目录')
+    args = parser.parse_args()
+    
+    print(f"处理文件: {args.cluster}")
+    result = fit_cylinder_consistent(args.cluster, args.out)
+    
+    if result:
+        print("\n拟合结果(与原始代码完全一致):")
+        print(f"- 起点坐标: {result['start']}")
+        print(f"- 终点坐标: {result['end']}")
+        print(f"- 半径: {result['radius']:.4f}m")
+        print(f"- 长度: {result['length']:.2f}m")
+        print(f"- 方向向量: {result['direction']}")
+        print(f"- 包含点数: {result['num_points']}")
+        print(f"- 内点数量: {len(result['inlier_indices'])}")
+        print(f"- 聚类点数量: {len(result['cluster_indices'])}")
+    else:
+        print("未能拟合出圆柱体")
