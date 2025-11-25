@@ -1,18 +1,203 @@
-import numpy as np
-import pipe_function as pn  # 也就是你当前的 pipe_function
+def create_ifc_file(cylinders, output_file, return_ifc=False):
+    """
+    Unit must be m.
+    :param cylinders:   A list, each element is dict, keys must include 'start' (shape is (3,)), 'end' (shape is (3,)), 'radius'.
+    :param output_file:
+    :return:
+    """
 
-def fit_from_saved_cluster(cluster_npz_path):
-    data = np.load(cluster_npz_path)
-    c = data["centerline"]
-    r = data["radii"]
-    d = data["dirs"]
-    surf = data["surf"]
+    # 创建IFC文件对象
+    ifc_file = ifcopenshell.file(schema='IFC2X3')
 
-    # 单个 cluster 的 label 全部置为 0 即可
-    labels = np.zeros(len(c), dtype=int)
+    # ================== 创建全局 OwnerHistory ==================
+    # 创建必要的人员和组织信息
+    person = ifc_file.createIfcPerson("User", "wei", "mc", None, None, None, None, None)
+    organization = ifc_file.createIfcOrganization(Name="ARL")
+    person_org = ifc_file.createIfcPersonAndOrganization(person, organization)
 
-    segs, _ = pn.extract_segments(c, r, d, labels, surf)
-    segs, raw_r, new_r = pn.filter_segments(segs)
+    # 创建应用信息（必须包含）
+    application = ifc_file.createIfcApplication(organization, "0.8.1", "IfcOpenShell", "IfcOpenShell")
 
-    # 一般来说这里 segs 只有一根 cylinder
-    return segs
+    # 创建 OwnerHistory（关键修复点）
+    owner_history = ifc_file.createIfcOwnerHistory(
+        person_org,
+        application,
+        ChangeAction="ADDED",
+        LastModifiedDate=int(time.time()),
+        CreationDate=int(time.time())
+    )
+
+    # ================== 创建空间结构 ==================
+    # 创建 Site（包含 CompositionType 和 OwnerHistory）
+    point = ifc_file.createIfcCartesianPoint((0.0, 0.0, 0.0))
+    axis_placement = ifc_file.createIfcAxis2Placement3D(point, None, None)
+
+    # 创建IFC项目和其他必要元素
+    project = ifc_file.create_entity(
+        'IfcProject',
+        Name="My Project",
+        GlobalId=ifcopenshell.guid.new(),
+        OwnerHistory=owner_history)
+
+    # 定义单位（关键步骤！）
+    length_unit = ifc_file.create_entity('IfcSIUnit', UnitType="LENGTHUNIT", Name="METRE")
+    unit_assignment = ifc_file.create_entity('IfcUnitAssignment', Units=[length_unit])
+    project.UnitsInContext = unit_assignment
+
+    # 创建几何上下文
+    context = ifc_file.create_entity(
+        'IfcGeometricRepresentationContext',
+        ContextType="Model",
+        CoordinateSpaceDimension=3,
+        Precision=1e-6,
+        WorldCoordinateSystem=ifc_file.create_entity(
+            'IfcAxis2Placement3D',
+            Location=ifc_file.create_entity('IfcCartesianPoint', Coordinates=(0.0, 0.0, 0.0))
+        )
+    )
+
+    project.RepresentationContexts = [context]
+
+    site_placement = ifc_file.createIfcLocalPlacement(None, axis_placement)
+    site = ifc_file.create_entity(
+        'IfcSite',
+        GlobalId=ifcopenshell.guid.new(),
+        OwnerHistory=owner_history,
+        Name="Default Site",
+        ObjectPlacement=site_placement,
+        CompositionType='ELEMENT'
+    )
+
+    # 创建 Building（包含 CompositionType 和 OwnerHistory）
+    building_placement = ifc_file.createIfcLocalPlacement(site_placement, axis_placement)
+    building = ifc_file.create_entity(
+        'IfcBuilding',
+        GlobalId=ifcopenshell.guid.new(),
+        OwnerHistory=owner_history,
+        Name="Building 1",
+        ObjectPlacement=building_placement,
+        CompositionType='ELEMENT'
+    )
+
+    # 创建 Storey（包含 CompositionType 和 OwnerHistory）
+    storey_placement = ifc_file.createIfcLocalPlacement(building_placement, axis_placement)
+    building_storey = ifc_file.create_entity(
+        'IfcBuildingStorey',
+        GlobalId=ifcopenshell.guid.new(),
+        OwnerHistory=owner_history,
+        Name="Storey 1",
+        ObjectPlacement=storey_placement,
+        CompositionType='ELEMENT'
+        )
+
+    # ================ 3. 绑定层级关系 ================
+    # 项目包含场地
+    ifc_file.create_entity(
+        'IfcRelAggregates',
+        GlobalId=ifcopenshell.guid.new(),
+        OwnerHistory=owner_history,
+        RelatingObject=project,
+        RelatedObjects=[site]
+        )
+
+    # 场地包含建筑
+    ifc_file.create_entity(
+        'IfcRelAggregates',
+        GlobalId=ifcopenshell.guid.new(),
+        OwnerHistory=owner_history,
+        RelatingObject=site,
+        RelatedObjects=[building]
+        )
+
+    # 建筑包含楼层
+    ifc_file.create_entity(
+        'IfcRelAggregates',
+        GlobalId=ifcopenshell.guid.new(),
+        OwnerHistory=owner_history,
+        RelatingObject=building,
+        RelatedObjects=[building_storey]
+        )
+
+    # ================== 创建流段实体 ==================
+    # 创建流段的 ObjectPlacement
+    # 为每个圆柱创建IfcFlowSegment
+    flow_segments = []
+    for cylinder in cylinders:
+        start = cylinder['start']
+        end = cylinder['end']
+        radius = cylinder['radius']
+
+        if np.linalg.norm(np.subtract(end, start)) == 0:
+            continue
+
+        cylinder_id = cylinder.get('id', 'unknown')  # 获取ID，如果没有则使用'unknown'
+        segment_name = f"FlowSegment_{cylinder_id}"  # 新命名格式
+
+        # 创建IFC的流动段（IfcFlowSegment）
+        flow_segment = ifc_file.create_entity(
+            'IfcFlowSegment',
+            GlobalId=ifcopenshell.guid.new(),
+            OwnerHistory=owner_history,
+            Name=segment_name,
+            ObjectPlacement=ifc_file.createIfcLocalPlacement(storey_placement, axis_placement)
+        )
+
+        # 创建圆柱的几何表示
+        cylinder_geometry = create_cylinder_geometry(ifc_file, start, end, radius, context)
+
+        # 将几何体添加到流动段中
+        flow_segment.Representation = ifc_file.create_entity(
+            'IfcProductDefinitionShape',
+            Representations=[cylinder_geometry]
+        )
+
+        pset = ifcopenshell.api.run(
+            "pset.add_pset",
+            ifc_file,
+            product=flow_segment,
+            name="Property"
+        )
+        length = get_length(cylinder)
+        confidence = cylinder.get('confidence', cylinder.get('coverage', 1.))
+        properties = {
+            'length': (f"{length:.3f}", "IfcLengthMeasure"),
+            'StartPoint': (f"({start[0]:.3f}, {start[1]:.3f}, {start[2]:.3f})", "IfcLabel"),
+            'EndPoint': (f"({end[0]:.3f}, {end[1]:.3f}, {end[2]:.3f})", "IfcLabel"),
+            'Radius': (f"{radius:.3f}", "IfcLengthMeasure"),
+            'Diameter': (f"{radius * 2:.3f}", "IfcLengthMeasure"),
+            'Confidence': (f"{confidence:.3f}", "IfcNormalisedRatioMeasure"),
+        }
+
+        ifcopenshell.api.pset.edit_pset(
+            ifc_file,
+            pset,
+            properties={k: v[0] for k, v in properties.items()}
+        )
+
+        flow_segments.append(flow_segment)
+
+    # 将流动段添加到建筑楼层
+    for flow_segment in flow_segments:
+        rel = ifc_file.create_entity(
+            'IfcRelContainedInSpatialStructure',
+            GlobalId=ifcopenshell.guid.new(),
+            OwnerHistory=owner_history,
+            RelatingStructure=building_storey,
+            RelatedElements=[flow_segment]
+        )
+        ifc_file.add(rel)
+
+    # 将建筑和楼层添加到文件
+    ifc_file.add(building)
+    ifc_file.add(building_storey)
+
+    # 将IFC项目添加到文件
+    ifc_file.add(project)
+
+    if return_ifc:
+        return ifc_file
+
+    # 保存IFC文件
+    ifc_file.write(output_file)
+    print(f"IFC file saved as {output_file}")
+    time.sleep(5)
