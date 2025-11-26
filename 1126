@@ -1,0 +1,69 @@
+import numpy as np
+import os
+import shutil
+from plyfile import PlyData, PlyElement
+
+def npy_to_ply(npy_path, ply_path):
+    """
+    将npy文件转换为ply格式
+    :param npy_path: 输入的npy文件路径
+    :param ply_path: 输出的ply文件路径
+    """
+    # 加载npy文件
+    points = np.load(npy_path)
+    
+    # 确保是Nx3的数组
+    if points.shape[1] != 3:
+        raise ValueError("Input numpy array should have shape (N,3)")
+    
+    # 创建ply顶点数据
+    vertex = np.array([tuple(p) for p in points],
+                     dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4')])
+    
+    # 创建PlyElement并保存
+    el = PlyElement.describe(vertex, 'vertex')
+    PlyData([el]).write(ply_path)
+    # print(f"Converted {npy_path} to {ply_path}")
+
+def process_directory(input_base_dir, output_base_dir):
+    """
+    处理input_base_dir目录下所有符合block_1Ftest_*模式的子目录
+    :param input_base_dir: 输入基础目录路径
+    :param output_base_dir: 输出基础目录路径
+    """
+    # 遍历input_base_dir下的所有子目录
+    for dir_name in os.listdir(input_base_dir):
+        if dir_name.startswith("block_1Ftest_"):
+            input_dir_path = os.path.join(input_base_dir, dir_name)
+            output_dir_path = os.path.join(output_base_dir, dir_name)
+            
+            # 创建对应的输出目录
+            os.makedirs(output_dir_path, exist_ok=True)
+            
+            # 遍历子目录中的所有npy文件
+            for file_name in os.listdir(input_dir_path):
+                if file_name.endswith(".npy"):
+                    input_npy_path = os.path.join(input_dir_path, file_name)
+                    output_ply_name = os.path.splitext(file_name)[0] + ".ply"
+                    output_ply_path = os.path.join(output_dir_path, output_ply_name)
+                    
+                    try:
+                        npy_to_ply(input_npy_path, output_ply_path)
+                    except Exception as e:
+                        print(f"Error processing {input_npy_path}: {str(e)}")
+
+if __name__ == "__main__":
+    input_base_dir = r"/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/cylinder_fitting_wo_merge__11_21_18_44/save_for_cluster"
+
+    output_base_dir = r"/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/cylinder_fitting_wo_merge__11_21_18_44/save_for_cluster_ply"
+       
+    # 检查输入目录是否存在
+    if not os.path.exists(input_base_dir):
+        print(f"Error: Input directory {input_base_dir} does not exist")
+        exit(1)
+    
+    # 确保输出目录存在
+    os.makedirs(output_base_dir, exist_ok=True)
+    
+    process_directory(input_base_dir, output_base_dir)
+    print("Conversion completed!")
