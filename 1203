@@ -1,0 +1,99 @@
+代码位置
+34.66, /media/samsung/samsung/mc.wei/code/DigitalTwin/src/pipeline_1125
+运行命令(run_all)
+登录到34.66,   用户名samsung 密码samsung(?)
+conda activate dt_label
+cd /media/samsung/samsung/mc.wei/code/DigitalTwin/src/pipeline_1125
+
+一次执行”运行命令(每个步骤)”里的三个步骤。
+python run_all.py  --input_path "/media/samsung/samsung/yw/L15/results_1119_round3" --res_path '/media/samsung/samsung/recons_res/res_zhh_1128' 
+
+有四个参数，如下：
+parser.add_argument('--input_path', default='/media/samsung/samsung/yw/L15/results_1119', type=str, help='path for input pts')
+parser.add_argument('--res_path', default='/media/samsung/samsung/recons_res/res_zhh_1125', type=str, help='path for all output things')
+parser.add_argument('--filter_str', default='block_*.pts.pkl', type=str, help='filter str for merging, used to select blocks')
+parser.add_argument('--gt_dir', default='/media/samsung/samsung/DigitalTwin2025/dataset/HQdata/mcwei_test/GTGen/15L/', type=str, help='GT dir for eval')
+
+一些要注意的点：
+	input_path: pts文件里，保存的点，最好有3位有效数字；
+	filter_str: 可以控制merge的区域范围，比如只merge A区；
+	gt_dir: 该目录实际有两个文件，一个原始gt的，另一个是small_seg_gt的。这两个文件需要生成，并且名字要固定成下面的名字，否则需要改代码或者增加参数.
+parser.add_argument('--rel_path_gt', default='P&D_20251121_seg1.0_BBOX_PRED.pkl', type=str)
+parser.add_argument('--rel_path_seg_gt', default='P&D_20251121_seg0.02_BBOX_PRED.pkl', type=str)
+
+目前的metric如下（有很小的随机性，扰动不超过0.001）.
+{'recall': 0.823, 'precision': 0.199, 'len_precision': 0.259, 'completeness': 0.893}
+运行命令(每个步骤)
+运行下面3个步骤，1是cyn fitting（包括clustering），2是merge (注意该步骤实际包含两个子步骤，先merge，再filter)，3是eval（和gt对比，计算量化指标）。
+
+1. python run.py  --input_path "/media/samsung/samsung/yw/L15/results_1119_round3" --res_path '/media/samsung/samsung/recons_res/res_zhh_1126'
+
+--input_path: 输入数据所在的目录。输入数据是分割和参数估计的结果，每个block对应一个pts文件，pts文件的每一行对应一个点，依次是x,y,z,nx,ny,nz,dir_x,dir_y,dir_z,radius,semantic_label，具体参见pipe_function里的load_txt_data.
+--res_path: 结果的输出目录。输出数据保存成json文件，TODO，
+
+2. python merge_cyn_non_gt_dir.py --path_cyns '/media/samsung/samsung/recons_res/res_zhh_1126/cylinder_fitting_1F_newclusterv2round2_a0.001_wo_R2C1st_wo_R2C2nd_wo_merge/save_for_vis/block_*.pts.pkl' --res_path '/media/samsung/samsung/recons_res/res_zhh_1126' --pts_path '/media/samsung/samsung/yw/L15/results_1119_round3'
+
+--path_cyns  for both input cylinders and output merged cylinders.
+--res_path  for merge log
+--pts_path for pts files (和run.py里的--input_path一样)
+
+
+3. python evaluation_global_L15.py --results_path_merge /media/samsung/samsung/recons_res/res_zhh_1126/cylinder_fitting_1F_newclusterv2round2_a0.001_wo_R2C1st_wo_R2C2nd_wo_merge/ifc_merge/11_26_13_51/output4_cyns.pkl --strong_merge --root "/media/samsung/samsung/DigitalTwin2025/dataset/HQdata/mcwei_test/GTGen/15L/"
+
+
+--results_path_merge  'merge result file'
+--root  'Root directory of GT.'
+
+Key data
+Cyn fitting的输入（即分割和参数估计的结果）
+	在input_path指定的目录里，每个block对应一个pts文件
+	pts文件的每一行对应一个点的信息，依次是
+x,y,z,nx,ny,nz,dir_x,dir_y,dir_z,radius,semantic_label，
+具体参见pipe_function里的load_txt_data.
+	/media/samsung/samsung/yw/L15/results_1119_round3里面，是L15 Zone A-C的数据（第一批发来的）
+Cyn fitting的结果
+1.	PKL files: 这个是主要的输出, 在save_for_vis子目录下.
+	这些是步骤2（merge）的输入，--path_cyns指定的那些pts.pkl文件。
+	list of all cylinder (lst_cyns), where each cylinder (lst_cyns[i]) is a dict, keys are 'start', 'end', 'radius', 'length', 'direction', 'ind_clustered', 'in_inlier'.
+	详细的读取见merge_cyn_non_gt_dir.py里的load_cyns_and_pcs.
+	示例文件见
+/media/samsung/samsung/recons_res/res_zhh_1128/cylinder_fitting_1F_newclusterv2round2_a0.001_wo_R2C1st_wo_R2C2nd_wo_merge_11_27_15_54/save_for_vis/block_*.pts.pkl
+
+2.	其他的一些辅助文件，包括：
+	pts.json files: 
+	save_for_cluster子目录下的内容:
+
+Merge的结果
+	步骤2的输出，会在path_cyns里面创建目录来保存结果。
+	保存的目录是path_cyns里ifc_merge子目录，再加一个{now.month}_{now.day}_{now.hour}_{now.minute}的子目录.
+	示例文件见
+/media/samsung/samsung/recons_res/res_zhh_1128/cylinder_fitting_1F_newclusterv2round2_a0.001_wo_R2C1st_wo_R2C2nd_wo_merge_11_27_15_54/ifc_merge/11_27_16_0/
+	list of all cylinder and corresponding pc (lst_cyn_filtered, lst_pc_filtered): 数据结构和输入的lst_cyns基本一样。下面这些是有点特殊的：
+	这里的'unified_id'字段是list，合并了merge到一起的input cylinder的该字段。
+	'coverage', 'CCR': 孟传计算的一些指标。
+	保存结果的code在函数filter_cyns和check_io_of_filtering里，注意下面几个文件名:
+	output2_cyns.pkl (output2_inliers.pkl) : merge的结果(filter_cyns的输入)   
+	output3_cyns.pkl和output2_cyns一样，只是把要滤掉的圆柱的'name'改成了-1.
+	output3_*.ifc: 内容和output3_cyns.pkl一样，ifc格式。
+	output4_cyns.pkl (output4_inliers.pkl) : filter_cyns的结果（是output2的子集）
+	还有一些加了颜色、做了一些filtering的圆柱，保存在ifc文件里：1. 保存的 IFC 文件时 confidence 作为伪彩色；2. 删掉 confidence 小于某个阈值的圆柱，然后保存为 IFC。具体文件如：
+	eval_output4_cyns.pkl：实际是eval时候保存的，pred和gt (long gt, not small seg)的match信息，参见eval文件里的tmp = dict(gt=gt, up=up, ug=ug).
+	 
+Eval之后的结果
+	步骤3的输出，会在path_cyns里面创建vis目录来保存结果。
+	示例文件如下：（目录/media/samsung/samsung/recons_res/res_zhh_1128/cylinder_fitting_1F_newclusterv2round2_a0.001_wo_R2C1st_wo_R2C2nd_wo_merge_11_27_15_54/ifc_merge/11_27_16_0/vis/）
+	GT_cyls.ifc
+	FN_cyls.ifc
+	pred_cyls.ifc
+	pred_pc.ply
+	FP_cyls.ifc
+	FP_pc.ply
+
+Acknowledgement
+pipeline_1125包括cyn fitting, merge, evaluation，分别来自：
+1. cyn fitting来自一伟, 34.66, /media/samsung/samsung/yw/cylinder_fitting_1125/, run.py和pipe_function.py. 集成了玉娇的save_for_cluster.
+2. merge来自张辉, 34.66, 
+/media/samsung/samsung/mc.wei/code/DigitalTwin/src/cyn_fitting_eval/, merge_cyn_non_gt_dir.py和utils_cylinder_fitting.py.
+3. eval来自孟传（主要是一伟开发），34.66, 
+/media/samsung/samsung/mc.wei/code/DigitalTwin/src/cyn_fitting_eval/, evaluation_global_L15.py
+
