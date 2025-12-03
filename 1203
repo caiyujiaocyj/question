@@ -1,34 +1,43 @@
-'diameter': 0.09466687495781213, 'radius': 0.04733343747890607, 'length': 0.15295541794693107,
-'direction': array([ 0.19538447, -0.98072559,  0.00149539]), 'unified_id': ['block_15L_CSF_A_4_0_0-0', 'block_15L_CSF_A_4_0_0-0'],
-'center': array([11.19157956, 79.42634166,  0.97980199]), 'bbox': (array([11.13021584, 79.34208953,  0.93235424]),
-array([11.25294328, 79.5105938 ,  1.02724974])), 'bbox_extend': (array([11.08021584, 79.29208953,  0.88235424]),
-array([11.30294328, 79.5605938 ,  1.07724974])), 'coverage': 0.06458333333333334, 'CCR': 0.13333333333333333},
-{'start': array([18.25605754, 66.87731925,  4.34518802]), 'end': array([18.25858186, 66.88852939,  4.21514722]), 
-'diameter': 0.10581041044917902, 'radius': 0.05290520522458951, 'length': 0.13054749390281462, 
-'direction': array([ 0.01933644,  0.08587017, -0.99611868]), 'unified_id': ['block_15L_CSF_C_6_2_1-0'], 
-'center': array([18.2573197 , 66.88292432,  4.28016762]), 'bbox': (array([18.20316222, 66.82460946,  4.21049049]), 
-array([18.31147717, 66.94123918,  4.34984476])), 'bbox_extend': (array([18.15316222, 66.77460946,  4.16049049]), 
-array([18.36147717, 66.99123918,  4.39984476])), 'coverage': 0.21008403361344538, 'CCR': 0.35294117647058826}, 
-{'start': array([17.36890366, 87.81295084,  3.60074287]), 'end': array([17.41967906, 87.72599819,  3.59131776]),
-'diameter': 0.04912603158166351, 'radius': 0.024563015790831755, 'length': 0.1011322723742753, 
-'direction': array([ 0.50206924, -0.85979126, -0.09319585]), 'unified_id': ['block_15L_CSF_A_6_3_1-0', 
-'block_15L_CSF_A_6_3_1-0'], 'bbox': (array([17.34766089, 87.71345519,  3.56686165]), array([17.44092183, 87.82549383,  3.62519898])), 
-'bbox_extend': (array([17.29766089, 87.66345519,  3.51686165]), array([17.49092183, 87.87549383,  3.67519898])), 
-'coverage': 0.2215909090909091, 'CCR': 0.875}, {'start': array([20.40417103, 66.56038318,  0.96271827]), 
-'end': array([20.40831214, 66.51860062,  1.1350315 ]), 'diameter': 0.058022830835062454, 'radius': 0.029011415417531227, 
-'length': 0.177354956438789, 'direction': array([ 0.0233493 , -0.2355872 ,  0.97157269]),
-'unified_id': ['block_15L_CSF_C_7_2_0-0', 'block_15L_CSF_C_7_2_0-0'], 'bbox': (array([20.37516752, 66.49040578,  0.95585006]), 
-array([20.43731565, 66.58857802,  1.1418997 ])), 'bbox_extend': (array([20.32516752, 66.44040578,  0.90585006]), 
-array([20.48731565, 66.63857802,  1.1918997 ])), 'coverage': 0.11695906432748537, 'CCR': 0.7368421052631579},
-{'start': array([21.28961727, 73.39162232,  4.70611528]), 'end': array([21.34318391, 73.40060871,  4.70634208]),
-'diameter': 0.05626847578301615, 'radius': 0.028134237891508075, 'length': 0.054315668909608594, 'direction':
-array([0.98620976, 0.16544749, 0.00417562]), 'unified_id': ['block_15L_CSF_B_7_1_1-0', 'block_15L_CSF_B_7_1_1-0'], 
-'center': array([21.31640059, 73.39611552,  4.70622868]), 'bbox': (array([21.28496104, 73.36387581,  4.67798128]),
-array([21.34784013, 73.42835522,  4.73447607])), 'bbox_extend': (array([21.23496104, 73.31387581,  4.62798128]),
-array([21.39784013, 73.47835522,  4.78447607])), 'coverage': 0.26851851851851855, 'CCR': 0.5}, 
-{'start': array([ 5.13686817, 76.31489507,  2.89572256]), 'end': array([ 5.24275609, 75.91828956,  2.01161673]),
-'diameter': 0.1765645674952295, 'radius': 0.08828228374761475, 'length': 0.9747570485955197, 'direction': 
-array([ 0.10863006, -0.40687627, -0.90700122]), 'unified_id': ['block_15L_CSF_B_2_2_0-0', 'block_15L_CSF_B_2_2_0-0',
-'block_15L_CSF_B_2_2_0-0', 'block_15L_CSF_B_2_2_0-0', 'block_15L_CSF_B_2_2_0-0', 'block_15L_CSF_B_2_2_0-0', 
-'block_15L_CSF_B_2_2_0-0', 'block_15L_CSF_B_2_2_0-0', 'block_15L_CSF_B_2_2_0-0'], 'bbox': (array([ 5.04910832, 75.83764517,  1.97443859]),
-array([ 5.33051594, 76.39553946,  2.9329007 ])), 'bbox_extend': (array([ 4.99910832, 75.78764517,  1.92443859]), array([ 5.38051594, 76.44553946,  2.9829007 ])), 
+flow_segments = []
+    for cylinder in cylinders:
+        start = cylinder['start']
+        end = cylinder['end']
+        radius = cylinder['radius']
+        # unified_id = cylinder['unified_id']
+        
+        if np.linalg.norm(np.subtract(end, start)) == 0:
+            continue
+
+        # unified_id = cylinder.get('unified_id', ["default_id"])  # 默认值可以是列表或字符串
+                
+        #         # 处理 unified_id 为列表的情况
+        # if isinstance(unified_id, list):
+        #     unified_id = "_".join(map(str, unified_id))  # 将列表转为字符串，如 "id1_id2_id3"
+
+        # original_name = cylinder.get('name', "FlowSegment")
+        # new_name = f"{original_name}_{unified_id}" 
+
+        if 'unified_id' not in cylinder:
+            print(f"Warning: Missing unified_id in {cylinder}")
+            continue
+        # 获取并处理 unified_id
+        unified_id = cylinder['unified_id']
+
+        unified_id = set(unified_id)
+
+        if isinstance(unified_id, list):
+            unified_id = "_".join(map(str, unified_id))  # 列表转字符串
+        
+        # 生成名称
+        original_name = cylinder.get('name', "FlowSegment")
+        new_name = f"{original_name}_{unified_id}"
+        print(f"Generated name: {new_name}")  # 调试输出
+
+        # 创建IFC的流动段（IfcFlowSegment）
+        flow_segment = ifc_file.create_entity(
+            'IfcFlowSegment',
+            GlobalId=ifcopenshell.guid.new(),
+            OwnerHistory=owner_history,
+            Name=new_name,
+            ObjectPlacement=ifc_file.createIfcLocalPlacement(storey_placement, axis_placement)
+        )
