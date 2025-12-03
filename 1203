@@ -1,3 +1,992 @@
+"""
+"""
+import argparse
+import multiprocessing
+import concurrent.futures
+import functools
+import copy, time, random
+import os, pdb, math
+from tqdm import tqdm
+import numpy as np
+import glob
+import json
+import pickle
+import logging
+from utils_cylinder_fitting import fit_cyn_using_directions_and_radii
+from datetime import datetime
+from scipy.spatial import KDTree
 
-Warning: Missing unified_id in {'start': array([10.44047184, 61.11181801,  0.94889678]), 'end': array([10.61457816, 60.96642816,  1.06899019]), 'diameter': 0.05444316613492939, 'radius': 0.027221583067464694, 'length': 0.2566586134521074, 'direction': array([ 0.67835758, -0.56647171,  0.4679111 ]), 'uid': [12778, 12778], 'bbox': (array([10.42047128, 60.94399537,  0.92483901]), array([10.63457872, 61.1342508 ,  1.09304796])), 'bbox_extend': (array([10.37047128, 60.89399537,  0.87483901]), array([10.68457872, 61.1842508 ,  1.14304796]))}
-Warning: Missing unified_id in {'start': array([ 5.62805462, 74.39786839,  3.71576112]), 'end': array([ 5.69208979, 74.42048398,  3.43698976]), 'diameter': 0.10802170102867552, 'radius': 0.05401085051433776, 'length': 0.2869241005863139, 'direction': array([ 0.22317809,  0.07882081, -0.97158573]), 'uid': [7890, 7890], 'bbox': (array([ 5.57540605, 74.34402558,  3.42420604]), array([ 5.74473836, 74.47432679,  3.72854483])), 'bbox_extend': (array([ 5.52540605, 74.29402558,  3.37420604]), array([ 5.79473836, 74.52432679,  3.77854483]))}
+from cylinders2IFC_v2 import create_ifc_file
+from color_the_ifc import set_color
+from utils import save_ply
+
+from filter_cyn_and_save_ifc import filter_and_save_ifc
+
+for_debug = False #True #using single thread when this flag is True.
+
+UNKNOWN_DIR = 10000 #unknown direction, for those directions not in gt_dir.
+
+THR_MIN_LEN_FOR_MEAN_RAD = 0.15 #长度太短的，就不用来算radius的平均。这个是相对量.
+
+#Multiprocessing params: how many processes.
+PROC_NUM = 10  #for find edge.
+NUM_PROC_CYN = 3 #2  #for ransac cyn fitting. set to 1 for single-thread proc, others for multi-proc.
+UNIT_PROC = 400 #the cyn fitting num for each proc.
+
+# 20251120, mcwei, compute confidence.
+from utils_fitting_3d import get_coverage, get_CCR
+LST_CONFIDENCE = ['coverage', 'CCR']
+NUM_PROC_CONFIDENCE = 4  
+
+#暂时就是3 or 2.
+def get_proc_num(cnt_fitting): # try to determine proc num dynamically, not working.
+    return NUM_PROC_CYN  #还是回到之前的版本.
+    nproc = int (cnt_fitting / UNIT_PROC + 0.5)
+    if nproc>3: nproc = 3
+    elif nproc<2: nproc = 2
+    return nproc
+
+THR_CLUSTER_DIRECTION = 5 #degree, or 10.
+
+THR_DIFF_DIR = 10 #degree, for those directions not in gt_dir.
+
+THR_CENTERLINE_DIST = 0.1  # 0.03 #meter. or 0.02.
+THR_RAD_SIMILAR = 1  # 0.2 #是个比例值
+THR_OVERLAP_LEN = 0.02 #meter, overlap.
+THR_MIN_DIS_OF_2PC = 0.05
+
+# Thresholds of filtering.
+THR_FILTER_MIN_NUM_INLIER = 20
+THR_FILTER_MIN_LEN = 0.05
+THR_FILTER_BBOX_TOLERANCE = 0.05  # 在判断两个 bbox 是否相交前，将两个 bbox 分别向 6 个方向扩大。
+THR_FILTER_MIN_RATIO_INLIER = 0.5  # 用于判断一个圆柱的 inlier 点是否不在另一个圆柱上，inlier 点比例小于它则不在。
+THR_FILTER_MAX_RATIO_INLIER = 0.9  # 用于判断一个圆柱的 inlier 点是否在另一个圆柱上，inlier 点比例大于它则在。
+THR_FILTER_MAX_RATIO_OVERLAP = 0.2  # 用于 filter 时删除 overlpap 的圆柱。
+# 20251203, mcwei, decrease time consumption when any pipe is too long.
+THR_FILTER_MIN_LEN_MUST_RESERVE = 5  # 根据两个圆柱的 overlap 删除一个圆柱时，如果某一圆柱长度超过此阈值，则一定不被删除。
+
+g_logger = None
+
+genhao2_half = 1.414213562373095049*.5 #sqrt(2.0)/2
+gt_directions = np.array([
+    [ 0.00,  genhao2_half, -genhao2_half, ], [ 0.00,  genhao2_half,  genhao2_half, ], [ genhao2_half,  -genhao2_half,  0.00,],
+    [ genhao2_half,  0.00, -genhao2_half, ], [ genhao2_half, -0.00,  genhao2_half, ], [ genhao2_half,   genhao2_half, -0.00,],
+    [ 0.00,  0.00,  1.00, ], [ 0.00,  1.00,  0.00, ], [ 1.00,   0.00,  0.00,]])
+
+LST_COLOR = [tuple(np.random.rand(3).tolist()) for _ in range(100000)] + [(0., 0., 0.)]
+
+
+PART_MAP = {'IfcFlowSegment-Pipe': 1,
+    'IfcFlowSegment-Conduit': 2,
+    'IfcFlowSegment-Round-Duct': 3,
+    'IfcFlowSegment-Rectangular-Duct': 4 }
+
+# PATH_CYNS = "/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/cylinder_fitting_wo_merge__10_22_12_42/save_for_vis/block_1Ftest_9*.pts.pkl"
+#DIR_PC = "data/HQdata/mcwei_test/GTCorrection/0818/output/v2_2_0820"
+#DIR_MAPPING = "data/HQdata/mcwei_test/GTCorrection/0818/output/v2_2_0820/ins_pkl"
+#PATH_OUTPUT = "data/HQdata/mcwei_test/GTCorrection/0818/output/merge_cyn_res/"  #zhh设置的output目录，包括log文件以及save_auto_labeling_format的结果.
+
+bboxes_testset = np.array([[6.5049e+01, 9.3114e+01, 2.0000e-03],  # min of test set
+    [129.049, 129.706,   6.641]  # max of test set
+])
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='')
+    parser.add_argument(#for both input (fitted cyns in each block) and output (merged cyns).
+        '--path_cyns',
+        type=str,
+        #default='/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/cylinder_fitting_wo_merge__10_22_12_42/save_for_vis/block_1Ftest_*.pts.pkl',
+        #1117: 孟传新跑了cyn fitting，输出了新格式的数据.
+        #default='/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/cylinder_fitting_wo_merge__11_14_17_56/save_for_vis/block_1Ftest_*.pts.pkl',
+        #1113: 一伟修改了clustering参数后的结果. 一伟的目录，写权限有问题，拷贝到新的目录下.
+        #default='/media/samsung/samsung/yw/NRDK_Cascade/baseline_s2_cascade_feat_guidance_30ep/result/cylinder_fitting_1F_newcluster_a0.001_wo_R2C1st_wo_N2D_wo_merge_dsf2/save_for_vis/block_1Ftest_*.pts.pkl',
+        #default='/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/yw_res/cylinder_fitting_1F_newcluster_a0.001_wo_R2C1st_wo_N2D_wo_merge_dsf2/save_for_vis/block_1Ftest_*.pts.pkl',
+        #1120: 一伟跑的L15的结果, copid from /media/samsung/samsung/yw/L15.
+        #default='/media/samsung/samsung/mc.wei/code/fitting_latest/exp/L15/results_1119/cylinder_fitting_1F_newcluster_a0.001_wo_R2C1st_wo_R2C2nd_wo_N2D_wo_merge/save_for_vis/block_*.pts.pkl',
+        #1124: 一伟新的L15的结果, copid from /media/samsung/samsung/yw/L15.
+        #default='/media/samsung/samsung/mc.wei/code/fitting_latest/exp/L15/results_1119/cylinder_fitting_1F_newclusterv2round2_a0.001_wo_R2C1st_wo_R2C2nd_wo_merge/save_for_vis/block_*.pts.pkl',
+        #1125: pipeline test.
+        default='/media/samsung/samsung/recons_res/res_zhh_1125/cylinder_fitting_1F_newclusterv2round2_a0.001_wo_R2C1st_wo_R2C2nd_wo_merge/save_for_vis/block_*.pts.pkl',
+        help=''
+    )
+    #for merge log.
+    parser.add_argument('--res_path', type=str,default='/media/samsung/samsung/recons_res/res_zhh_1125',help='')
+    #for pts files.
+    parser.add_argument('--pts_path', type=str,default='/media/samsung/samsung/yw/L15/results_1119',help='')
+
+    parser.add_argument('--n_proc', type=int, default=0, help='')
+    args = parser.parse_args()
+    print('Input:', args.path_cyns)
+    return args
+
+
+def is_cyn_in_bbox2(cyn, bbox):
+    def _clip(p0, p1, mn, mx):
+        # Copied from evaluation.py
+        t0, t1 = 0., 1.
+        d = p1 - p0
+        for i in range(3):
+            if abs(d[i]) < 1e-12:
+                if p0[i] < mn[i] or p0[i] > mx[i]: return None
+            else:
+                inv = 1. / d[i]
+                tE = (mn[i] - p0[i]) * inv
+                tL = (mx[i] - p0[i]) * inv
+                if tE > tL: tE, tL = tL, tE
+                t0 = max(t0, tE)
+                t1 = min(t1, tL)
+                if t0 > t1: return None
+        return p0 + t0 * d, p0 + t1 * d
+
+    mn = bbox.min(0)
+    mx = bbox.max(0)
+    return _clip(cyn['start'], cyn['end'], mn, mx) is not None
+
+
+def clip_pts(pc, bbox, logger):
+    mn,mx = bbox.min(0), bbox.max(0)
+    mask1 = (pc[:, :3] >= mn).all(axis=1) & (pc[:, :3] <= mx).all(axis=1)
+    pc_clipped = pc[ mask1 ]
+    #already checked: mask1 and mask2 are the same.
+    #mask2 = (pc[:,0]>=mn[0]) & (pc[:,0]<=mx[0]) & (pc[:,1]>=mn[1]) & (pc[:,1]<=mx[1]) & (pc[:,2]>=mn[2]) & (pc[:,2]<=mx[2])
+    #if (mask1^mask2).sum()!=0: logger.debug(f'clipping pts seem wrong.')
+
+    if len(pc) != len(pc_clipped): logger.debug(f'Original points: {len(pc)}, clipped points: {len(pc_clipped)}')
+    return pc_clipped
+
+def angle_between_vectors(v1, v2, degrees=True):
+    """
+    计算两个三维向量之间的夹角
+    参数:
+        v1 (np.array or list): 第一个向量 [x, y, z]
+        v2 (np.array or list): 第二个向量 [x, y, z]
+        degrees (bool): 是否返回角度值（默认True），False则返回弧度
+    返回:
+        float: 两个向量之间的夹角（角度或弧度）
+    原理:
+        cosθ = dot(v1, v2) / (||v1|| * ||v2||)
+        θ = arccos(cosθ)
+    """
+    a = np.asarray(v1)
+    b = np.asarray(v2)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    # 避免除以零
+    if norm_a == 0 or norm_b == 0:
+        raise ValueError("输入向量不能为零向量")
+    # 计算点积和余弦值
+    cos_theta = np.dot(a, b) / (norm_a * norm_b)
+    # 处理浮点精度问题（确保cos_theta在[-1,1]范围内）
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    # 计算角度（弧度）
+    angle_rad = np.arccos(cos_theta)
+    # if angle_rad>np.pi*0.5: angle_rad = np.pi - angle_rad
+    # 根据要求返回角度或弧度
+    return np.degrees(angle_rad) if degrees else angle_rad
+
+
+def check_io_of_filtering(lst_cyn, lst_pc, mask, dir_cyn):
+    dir_save = (dir_cyn if os.path.isdir(dir_cyn) else os.path.dirname(dir_cyn)).replace(
+        'save_for_vis', f'ifc_merge/{now.month}_{now.day}_{now.hour}_{now.minute}')
+    os.makedirs(dir_save, exist_ok=True)
+
+    num_cyn = len(lst_cyn)
+    lst_cyn_tmp = []
+    for i in range(num_cyn):
+        cyn = copy.deepcopy(lst_cyn[i])
+        if not mask[i]:
+            cyn['name'] = '-1'
+        else:
+            cyn['name'] = str(i)
+        lst_cyn_tmp.append(cyn)
+
+    pickle.dump(lst_cyn_tmp, open(f"{dir_save}/output3_cyns.pkl", 'wb'))
+
+    lst_cyn_valid = [lst_cyn[i] for i in range(num_cyn) if mask[i]]
+    lst_pc_valid = [lst_pc[i] for i in range(num_cyn) if mask[i]]
+
+    path_cyn_file = f"{dir_save}/output4_cyns.pkl"
+    pickle.dump(lst_cyn_valid, open(path_cyn_file, 'wb'))
+    pickle.dump(lst_pc_valid, open(f"{dir_save}/output4_inliers.pkl", 'wb'))
+
+    save_ply(lst_pc_valid, f"{dir_save}/output4_inliers.ply")
+
+    ifc_file = create_ifc_file(lst_cyn_tmp, '', return_ifc=True)
+    for element in ifc_file.by_type("IfcFlowSegment"):
+        color = LST_COLOR[int(element.Name)]
+        set_color(color, element, ifc_file, {})
+    file_save = f"output3_{'all' if os.path.isdir(dir_cyn) else os.path.basename(dir_cyn).replace('*', '')}.ifc"
+    path_save_in = os.path.join(dir_save, file_save)
+    ifc_file.write(path_save_in)
+    return path_cyn_file #e.g. /media/samsung/samsung/recons_res/res_zhh_1127/cylinder_fitting_1F_newclusterv2round2_a0.001_wo_R2C1st_wo_R2C2nd_wo_merge/ifc_merge/11_26_17_59/output4_cyns.pkl
+
+
+def color_cyns_by_angle_to_ifc(dict_cyns_each_direction, dir_cyn, name='input'):
+    file_save = f"{name}_{'all' if os.path.isdir(dir_cyn) else os.path.basename(dir_cyn).replace('*', '')}.ifc"
+    path_save = os.path.join((dir_cyn if os.path.isdir(dir_cyn) else os.path.dirname(dir_cyn)).replace('save_for_vis', 'ifc_merge_by_angle'), file_save)
+    os.makedirs(os.path.dirname(path_save), exist_ok=True)
+    lst_cyn = []
+    for k, v in dict_cyns_each_direction.items():
+        for cyn in v:
+            lst_cyn.append({
+                'start': cyn['start'],
+                'end': cyn['end'],
+                'radius': cyn['radius'],
+                'name': str(k),
+            })
+
+    colors = ((gt_directions - gt_directions.min()) / (gt_directions.max() - gt_directions.min()))
+    ifc_file = create_ifc_file(lst_cyn, path_save, return_ifc=True)
+
+    cache_surface_style = {}
+    for element in ifc_file.by_type("IfcFlowSegment"):
+        color = tuple(colors[int(element.Name)].tolist())
+        set_color(color, element, ifc_file, cache_surface_style)
+
+    ifc_file.write(path_save)
+    return
+
+def calc_dist_point_to_seg(pt, A, B): #计算pt到由A,B组成的segment的距离，返回交点在线段的哪侧，以及线段外延伸的距离.
+    v = B-A  #seg_b.terminals[1] - seg_b.terminals[0]
+    w = A-pt #seg_b.terminals[0] - seg_a.terminals[0]
+    t = -w.dot(v) / v.dot(v)
+    closest_line2 = A + v * t  #交点，t代表了交点在哪侧, <0表示在A外侧，>1表示在B外侧, [0,1]表示在线段内部.
+    if t<0: dist_extend = np.linalg.norm(A - closest_line2)
+    elif t>1: dist_extend = np.linalg.norm(B - closest_line2)
+    else: dist_extend = 0
+    dist = np.linalg.norm(pt - closest_line2)
+
+    return dist, t, dist_extend #dist是点到直线的距离，dist_extend是线段外的延伸距离，t表示了在哪侧（见上面注释）
+
+#相当于计算两个cyn的overlap
+def calc_dist_ext(pt1, pt2, A, B):
+    v = B-A  #seg_b.terminals[1] - seg_b.terminals[0]
+    w1, w2 = A-pt1, A-pt2 #seg_b.terminals[0] - seg_a.terminals[0]
+    val = v.dot(v)
+    t1, t2 = -w1.dot(v) / val, -w2.dot(v) / val
+
+    if 0<=t1<=1 or 0<=t2<=1: return 0
+    t1 = -t1 if t1<0 else t1-1
+    t2 = -t2 if t2<0 else t2-1
+    t = min(t1, t2)
+
+    return t * np.linalg.norm(v)
+
+def calc_dist_point_to_line(pt, A, B): #计算pt到由A,B组成的直线的距离.
+    v = B-A  #seg_b.terminals[1] - seg_b.terminals[0]
+    w = A-pt #seg_b.terminals[0] - seg_a.terminals[0]
+    t = -w.dot(v) / v.dot(v)
+    closest_line2 = A + v * t  #交点，t代表了交点在哪侧, <0表示在A外侧，>1表示在B外侧, [0,1]表示在线段内部.
+    dist = np.linalg.norm(pt - closest_line2)
+    return dist
+
+def cluster_with_direction(lst_cyns, ref_dirs, thr_cluster_direction):
+    dict_cyns_each_direction = {}
+    lst_min_diff = []
+    cnt_dirs = ref_dirs.shape[0]
+    for i in range(cnt_dirs+1): dict_cyns_each_direction[i] = [] #初始化每个cluster.
+    for j, cyn in tqdm(enumerate(lst_cyns), 'cluster with direction...'):
+        found = False
+        #diffs = []
+        for i in range(cnt_dirs):
+            angle_diff = angle_between_vectors(cyn['direction'], ref_dirs[i])
+            if angle_diff > 90:
+                angle_diff = 180 - angle_diff
+                cyn['direction'] = -cyn['direction']
+            #diffs.append(angle_diff)
+            if angle_diff<thr_cluster_direction:
+                found = True
+                dict_cyns_each_direction[i].append(cyn)
+                if j in observed_set: 
+                    observed_set_vals[j]['dir_set'] = i
+                    observed_set_vals[j]['seq_in_dir_set'] = len(dict_cyns_each_direction[i])-1
+                lst_min_diff.append(angle_diff)
+                break
+        if not found: 
+            dict_cyns_each_direction[cnt_dirs].append(cyn)
+            if j in observed_set: 
+                observed_set_vals[j]['dir_set'] = UNKNOWN_DIR
+                observed_set_vals[j]['seq_in_dir_set'] = len(dict_cyns_each_direction[cnt_dirs])-1
+    return dict_cyns_each_direction
+
+
+def cal_min_dis_between_2pcs(pc1, pc2):
+    """
+    Calculate minimum distance between 2 PCs
+    :param pc1: (n, 17)
+    :param pc2: (m, 17)
+    :return:
+    """
+    pts1 = pc1[:, :3]  # (n, 3)
+    pts2 = pc2[:, :3]  # (m, 3)
+
+    # O((m + n)log(min(m, n))
+    if len(pts1) < len(pts2):
+        tree = KDTree(pts2)
+        dis, _ = tree.query(pts1, k=1)
+    else:
+        tree = KDTree(pts1)
+        dis, _ = tree.query(pts2, k=1)
+    return np.min(dis)
+
+
+def is_similar_cyn(cyn1, cyn2, pc1, pc2): #满足3个条件
+    start1, end1, rad1 = cyn1['start'], cyn1['end'], cyn1['radius']
+    start2, end2, rad2 = cyn2['start'], cyn2['end'], cyn2['radius']
+    #assert same_direction(cyn1, cyn2), 'error. only work for parallel cyns'
+
+    #条件1: radius相似
+    diff = abs(rad1-rad2)
+    diff_rad = min(diff/rad1, diff/rad2)
+    if diff_rad>THR_RAD_SIMILAR: return False
+
+    #条件2: 在沿着圆柱的方向上相距很近（即overlap）
+    dist_ext = calc_dist_ext(start1, end1, start2, end2)
+    if dist_ext>THR_OVERLAP_LEN:
+        dist_ext2 = calc_dist_ext(start2, end2, start1, end1)
+        if dist_ext2>THR_OVERLAP_LEN: return False
+
+    #条件3: centerline distance比较小.
+    dist = calc_dist_point_to_line(start1, start2, end2)
+    #check same direction: debug purpose.
+    dist2 = calc_dist_point_to_line(end1, start2, end2)
+    assert abs(dist-dist2)<1e-6, 'error. two cyns are not parallel!'
+    if dist>THR_CENTERLINE_DIST: return False
+
+    # 条件4：两个点云间距比较小
+    if cal_min_dis_between_2pcs(pc1, pc2) > THR_MIN_DIS_OF_2PC: return False
+    return True
+
+
+
+#这个函数应该稍快些，只用调用一次.
+def calc_dist_ext_new(pt1, pt2, A, B, length_AB):
+    v = B-A  #seg_b.terminals[1] - seg_b.terminals[0]
+    w1, w2 = A-pt1, A-pt2 #seg_b.terminals[0] - seg_a.terminals[0]
+    val = v.dot(v)
+    t1, t2 = -w1.dot(v) / val, -w2.dot(v) / val
+
+    t1_org = t1
+
+    if t1>t2: t1,t2 = t2,t1  #确保t1<=t2.
+
+    #求区间[0,1]和[t1, t2]的交集[vmin, vmax].
+    vmin, vmax = max(0, t1), min(t2, 1)
+
+    if vmax>=vmin: return 0, t1_org, v #区间相交.
+    elif vmin==0: return length_AB*(-t2), t1_org, v  #t1,t2都小于0.
+    else: return length_AB*(t1-1), t1_org, v #t1,t2都大于1.
+
+def calc_dist_point_to_line_new(pt, A, B, t, v): #计算pt到由A,B组成的直线的距离.
+    #上面的calc_dist_ext里算了，不用重复。不过要注意调用这两个函数的A, B， pt是对应的.
+    #v = B-A  #seg_b.terminals[1] - seg_b.terminals[0]
+    #w = A-pt #seg_b.terminals[0] - seg_a.terminals[0]
+    #t = -w.dot(v) / v.dot(v)
+    closest_line2 = A + v * t  #交点，t代表了交点在哪侧, <0表示在A外侧，>1表示在B外侧, [0,1]表示在线段内部.
+    dist = np.linalg.norm(pt - closest_line2)
+    return dist
+
+def project_point_onto_line(pt, pt1, dir1):
+    """
+    将点 pt 投影到由点 pt1 和方向向量 dir1 决定的直线上。
+    Args:
+        pt (np.ndarray): 要被投影的目标点 (坐标)。
+        pt1 (np.ndarray): 直线上的一个已知点 (坐标)。
+        dir1 (np.ndarray): 直线的方向向量 (坐标)。
+    Returns:
+        np.ndarray: 投影点 (proj_pt) 的坐标。
+    """
+    # 确保输入为 NumPy 数组以便进行向量运算
+    pt = np.asarray(pt)
+    pt1 = np.asarray(pt1)
+    dir1 = np.asarray(dir1)
+    # 1. 计算从 pt1 指向 pt 的向量
+    vector_to_project = pt - pt1
+    
+    t = np.dot(vector_to_project, dir1) / np.dot(dir1, dir1)
+    # 3. 计算投影点坐标
+    proj_pt = pt1 + t * dir1
+    return proj_pt
+
+#len1, len2: 两个圆柱的长度.
+#is_diff_dir: True表示lst里的圆柱不是相同方向的(针对gt_dir不完全的情况), False是原来的情况(lst里所有圆柱都是同一方向的).
+def is_similar_cyn_new(is_diff_dir, cyn1, cyn2, pc1, pc2, len1, len2): #满足4个条件
+    start1, end1, rad1 = cyn1['start'], cyn1['end'], cyn1['radius']
+    start2, end2, rad2 = cyn2['start'], cyn2['end'], cyn2['radius']
+    #assert same_direction(cyn1, cyn2), 'error. only work for parallel cyns'
+
+    if is_diff_dir: #增加的条件，处理圆柱方向不同的情况.
+        angle_diff = angle_between_vectors(cyn1['direction'], cyn2['direction'])
+        if angle_diff > 90:  angle_diff = 180 - angle_diff
+        if angle_diff > THR_DIFF_DIR: return False
+        #adjust the shorter cyn.
+        if len1>len2 and len1>0.5: #switch 1 and 2, to make cyn1 be the shorter one.
+            start1,end1,rad1,len1, start2,end2,rad2,len2 = start2,end2,rad2,len2, start1,end1,rad1,len1
+        #project start1,end1 to the line determined by mid1 and dir2.
+        mid1, dir2 = (start1+end1)*.5, end2-start2
+        start1 = project_point_onto_line(start1, mid1, dir2)
+        end1 = project_point_onto_line(end1, mid1, dir2)
+
+    #条件1: radius相似
+    diff = abs(rad1-rad2)
+    diff_rad = min(diff/rad1, diff/rad2)
+    if diff_rad>THR_RAD_SIMILAR: return False
+
+    #条件2: 在沿着圆柱的方向上相距很近（即overlap）
+    '''
+    if 0:  #老的算法，效率差一些。
+        dist_ext = calc_dist_ext(start1, end1, start2, end2)
+        if dist_ext>THR_OVERLAP_LEN:
+            dist_ext2 = calc_dist_ext(start2, end2, start1, end1)
+            if dist_ext2>THR_OVERLAP_LEN: return False
+    else: #新算法，效率高一些.
+    '''
+    dist_ext, t1, v = calc_dist_ext_new(start1, end1, start2, end2, len2)
+    if dist_ext>THR_OVERLAP_LEN: return False
+
+    #条件3: centerline distance比较小.
+    dist = calc_dist_point_to_line_new(start1, start2, end2, t1, v)
+    #check same direction: debug purpose.
+    #dist2 = calc_dist_point_to_line(end1, start2, end2)
+    #assert abs(dist-dist2)<1e-6, 'error. two cyns are not parallel!'
+
+    # 20251118, zhh, fix: thick pipes can't be clustered.
+    rad = (rad1+rad2)*.5
+    if rad>0.2:
+        if dist>rad: return False
+    elif dist>THR_CENTERLINE_DIST: return False
+
+    # 条件4：两个点云间距比较小
+    if cal_min_dis_between_2pcs(pc1, pc2) > THR_MIN_DIS_OF_2PC: return False  #我注释了这行，时间消耗降低不多，不到1min (12.3min to 12min).
+    return True
+
+def find_edge_single(i_proc, config):
+    cnt_nodes = config.get('cnt_nodes', None)
+    lst_cyns, lst_pc, len_cyns = config.get('lst_cyns', None), config.get('lst_pc', None), config.get('len_cyns', None)
+    is_diff_dir = config.get('is_diff_dir', None)
+    cnt_each_proc = cnt_nodes // PROC_NUM
+    start, end = cnt_each_proc*i_proc, cnt_each_proc*(i_proc+1)
+    if i_proc == PROC_NUM-1: end = cnt_nodes
+    all_pairs = []
+    for i in range(start, end):
+      for j in range(i+1, cnt_nodes):
+        cyn1, cyn2 = lst_cyns[i], lst_cyns[j]
+        pc1, pc2 = lst_pc[i], lst_pc[j]
+        if check_far_enough(cyn1, cyn2): continue
+        is_similar = is_similar_cyn_new(is_diff_dir, cyn1, cyn2, pc1, pc2, len_cyns[i], len_cyns[j])
+        if is_similar:  all_pairs.append((i,j))
+    return all_pairs
+
+def find_edges_multiproc(lst_cyns, lst_pc, is_diff_dir, thr_centerline_dist):
+    edges, cnt_nodes, len_cyns = {}, len(lst_cyns), []
+    for i in range(cnt_nodes):
+        edges[i] = [] #directly save the connected nodes.
+        lst_cyns[i]['center'] = (lst_cyns[i]['start'] + lst_cyns[i]['end'])*.5
+        len_cyns.append(np.linalg.norm(lst_cyns[i]['start'] - lst_cyns[i]['end']))
+
+    public_config = {"cnt_nodes": cnt_nodes, "lst_cyns": lst_cyns, "lst_pc": lst_pc, "len_cyns": len_cyns, "is_diff_dir": is_diff_dir}
+    task_for_worker = functools.partial(find_edge_single, config=public_config)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=PROC_NUM) as executor:
+        results_iterator = executor.map(task_for_worker, range(PROC_NUM))
+        #res_all = list(results_iterator)
+        for res in results_iterator: #res_all:
+            for item in res:
+                i,j = item
+                edges[i].append(j)
+                edges[j].append(i)
+
+    #calc degree.
+    deg_nodes = []
+    for i in range(cnt_nodes): deg_nodes.append(len(edges[i]))
+    return edges, deg_nodes
+    #edges: a dict, key is node, value is the list of all connected nodes.
+
+def check_far_enough(cyn1, cyn2):
+    thr1, thr2 = 25, 100 #thr for squared dist.
+    large_len = 3 #meter.
+    diff = cyn1['center']-cyn2['center']
+    dist = np.dot(diff, diff)  #避免平方根
+    if dist>thr1: #对于长度比较大的pipes (现在粗管可能会很长)，只用center点不太合适.
+        if dist>thr2: return True
+        if cyn1['length']>=large_len: 
+            diff1 = cyn2['center'] - cyn1['start']
+            v1 = np.dot(diff1, diff1)
+            diff2 = cyn2['center'] - cyn1['end']
+            v2 = np.dot(diff2, diff2)
+            if v1>thr1 and v2>thr1: return True
+        elif cyn2['length']>=large_len: 
+            diff1 = cyn1['center'] - cyn2['start']
+            v1 = np.dot(diff1, diff1)
+            diff2 = cyn1['center'] - cyn2['end']
+            v2 = np.dot(diff2, diff2)
+            if v1>thr1 and v2>thr1: return True
+        else: return False
+    return False
+
+#只看cluster_cyn里的是否构成edge.
+def find_edges_debug(cluster_cyn, lst_cyns_full, lst_pcs_full, thr_centerline_dist, is_diff_dir):
+    lst_cyns, lst_pc = [], []
+    for i in cluster_cyn: 
+        lst_cyns.append(lst_cyns_full[i])
+        lst_pc.append(lst_pcs_full[i])
+        lst_cyns[-1]['id_zhh'] = i
+
+    edges, cnt_nodes, len_cyns = {}, len(lst_cyns), []
+    for i in range(cnt_nodes):
+        edges[i] = [lst_cyns[i]['id_zhh'],] #directly save the connected nodes.
+        lst_cyns[i]['center'] = (lst_cyns[i]['start'] + lst_cyns[i]['end'])*.5
+        len_cyns.append(np.linalg.norm(lst_cyns[i]['start'] - lst_cyns[i]['end']))
+    for i in range(cnt_nodes):
+      for j in range(i+1, cnt_nodes):
+        cyn1, cyn2 = lst_cyns[i], lst_cyns[j]
+        pc1, pc2 = lst_pc[i], lst_pc[j]
+        if check_far_enough(cyn1, cyn2): continue
+        is_similar = is_similar_cyn_new(is_diff_dir, cyn1, cyn2, pc1, pc2, len_cyns[i], len_cyns[j])
+        if is_similar:
+            edges[i].append(lst_cyns[j]['id_zhh'])
+            edges[j].append(lst_cyns[i]['id_zhh'])
+    return edges  #edges[i]里面保存的是cluster_cyn里的id值，第一个是自己.
+
+#single thread.
+def find_edges(lst_cyns, lst_pc, is_diff_dir, thr_centerline_dist):
+    edges, cnt_nodes, len_cyns = {}, len(lst_cyns), []
+    for i in range(cnt_nodes):
+        edges[i] = [] #directly save the connected nodes.
+        lst_cyns[i]['center'] = (lst_cyns[i]['start'] + lst_cyns[i]['end'])*.5
+        len_cyns.append(np.linalg.norm(lst_cyns[i]['start'] - lst_cyns[i]['end']))
+    #for i in tqdm(range(cnt_nodes)):
+    for i in range(cnt_nodes):
+      for j in range(i+1, cnt_nodes):
+        cyn1, cyn2 = lst_cyns[i], lst_cyns[j]
+        pc1, pc2 = lst_pc[i], lst_pc[j]
+        if check_far_enough(cyn1, cyn2): continue
+        is_similar = is_similar_cyn_new(is_diff_dir, cyn1, cyn2, pc1, pc2, len_cyns[i], len_cyns[j])
+        if is_similar:
+            edges[i].append(j)
+            edges[j].append(i)
+
+    #calc degree.
+    deg_nodes = []
+    for i in range(cnt_nodes): deg_nodes.append(len(edges[i]))
+    return edges, deg_nodes
+    #edges: a dict, key is node, value is the list of all connected nodes.
+
+
+def fit_cyn(direction_gt, radius_gt, pc, logger, mode=0):
+    """
+    zhanghui: start from ransac_circle_fitting_with_radius from core_pipe_correction.py.
+    :param direction_gt, radius_gt: 圆柱的初始参数.
+    :param pc: the mreged pc for all clusters in cluster_cyn.
+    :param mode:
+        0: Directions are used as GT, radii are used to filter bad models.
+        1:
+    :return:
+    """
+    #pc = get_pc_of_cyns(args.path_cyns, [lst_cyns[i] for i in cluster_cyn], merge_pc=True)
+    lst_cyn, lst_ind_inlier = [], []
+
+    if mode == 0:
+        # Directions are used as GT, radii are used to filter bad models.
+        lst_cyn, lst_ind_inlier = fit_cyn_using_directions_and_radii(direction_gt, radius_gt, pc, logger)
+    else:
+        # Todo: implement other cylinder fitting algorithms.
+        pass
+
+    return lst_cyn, lst_ind_inlier
+
+def generate_cylinder(start, end, radius, segments=12):
+    """生成任意方向圆柱的顶点和面"""
+    # 计算圆柱方向向量
+    direction = np.array(end) - np.array(start)
+    length = np.linalg.norm(direction)
+    if length < 1e-6:  # 忽略长度接近0的圆柱
+        return [], []
+
+    z_axis = np.array([0, 0, 1])
+    direction_normalized = direction / length
+
+    # 计算旋转轴和角度
+    rot_axis = np.cross(z_axis, direction_normalized)
+    rot_angle = np.arccos(np.clip(np.dot(z_axis, direction_normalized), -1, 1))
+
+    # 如果没有旋转（圆柱已经沿Z轴）
+    if np.isclose(rot_angle, 0):
+        rot_matrix = np.eye(3)
+    else:
+        # 创建旋转矩阵 (Rodrigues旋转公式)
+        rot_axis = rot_axis / np.linalg.norm(rot_axis)
+        K = np.array([
+            [0, -rot_axis[2], rot_axis[1]],
+            [rot_axis[2], 0, -rot_axis[0]],
+            [-rot_axis[1], rot_axis[0], 0]
+        ])
+        rot_matrix = np.eye(3) + np.sin(rot_angle) * K + (1 - np.cos(rot_angle)) * K @ K
+
+    # 生成圆柱顶点
+    vertices = []
+    # 底部中心点
+    vertices.append(np.array(start))
+    # 底部圆形顶点
+    for i in range(segments):
+        angle = 2 * np.pi * i / segments
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        z = 0
+        point = np.array([x, y, z])
+        rotated_point = rot_matrix @ point
+        translated_point = rotated_point + np.array(start)
+        vertices.append(translated_point)
+
+    # 顶部中心点
+    vertices.append(np.array(end))
+    # 顶部圆形顶点
+    for i in range(segments):
+        angle = 2 * np.pi * i / segments
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        z = length
+        point = np.array([x, y, z])
+        rotated_point = rot_matrix @ point
+        translated_point = rotated_point + np.array(start)
+        vertices.append(translated_point)
+
+    # 生成面
+    faces = []
+    # 底部圆形面
+    for i in range(segments):
+        next_i = 1 + (i + 1) % segments
+        faces.append([0, 1 + i, next_i])
+
+    # 顶部圆形面
+    top_center = 1 + segments
+    for i in range(segments):
+        next_i = top_center + 1 + (i + 1) % segments
+        faces.append([top_center, next_i, top_center + 1 + i])
+
+    # 侧面
+    for i in range(segments):
+        next_i = (i + 1) % segments
+        bottom_v1 = 1 + i
+        bottom_v2 = 1 + next_i
+        top_v1 = top_center + 1 + i
+        top_v2 = top_center + 1 + next_i
+        faces.append([bottom_v1, bottom_v2, top_v2])
+        faces.append([top_v2, top_v1, bottom_v1])
+
+    return vertices, faces
+
+def to_obj_cylinders(params_list, obj_file, segments=16, centerline=False):
+    """
+    将多个圆柱体参数保存为单个OBJ文件，自动拼接所有圆柱体的顶点和面。
+
+    Args:
+        params_list: 列表，每个元素是圆柱体参数，格式为 [start, end, radius]
+        obj_file: 输出的OBJ文件路径
+        segments: 圆柱圆周的细分段数（越大越平滑）
+        centerline: 是否以中心线显示（极细圆柱，线条模式）
+    """
+    #vertex_offset, all_vertices, all_faces = 0, [],[]  #不需要保存到一个全局序列里.
+    #extract all data.
+    objects_data = []
+    for params in params_list:
+        if params is None: continue  # 忽略空参数
+        # 提取圆柱体参数
+        start = params["start"] if len(params) >= 1 else None
+        end = params["end"] if len(params) >= 2 else None
+        radius = params["radius"] if len(params) >= 3 else None
+        if centerline: radius = 0.01  # 极细圆柱，模拟中心线
+
+        # 生成当前圆柱体的顶点和面
+        vertices, faces = generate_cylinder(start, end, radius, segments)
+        if len(faces)>0:
+            obj_data = {}
+            obj_data['vertices'] = vertices
+            obj_data['faces'] = faces
+            #all_vertices.extend(obj_data['vertices'])
+            #for face in obj_data['faces']:
+            #    # 假设面元是 v/vt/vn 格式
+            #    # 例如: (1, 1, 1) -> (1 + vertex_offset, 1 + tex_coord_offset, 1 + normal_offset)
+            #    #new_face = tuple(idx + off for idx, off in zip(face, vertex_offset))
+            #    new_face = (face[0]+vertex_offset, face[1]+vertex_offset, face[2]+vertex_offset)
+            #    all_faces.append(new_face)
+            #vertex_offset += len(obj_data['vertices'])
+            objects_data.append(obj_data)
+
+    with open(obj_file, 'w') as f:
+        #f.write("# All Vertices (v)\n")
+        #for v in all_vertices:
+        #    f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        f.write("\n# All Faces\n")
+        current_v_offset = 0
+        for i in range(len(objects_data)):
+            obj_data = objects_data[i]
+            obj_name = f"cyn-{i:03d}"
+            f.write(f"o {obj_name}\n")  # 写入组指令  g指令在cloudcompare里不行，改成o指令.
+            for v in obj_data['vertices']:
+                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+            for face in obj_data['faces']:
+                # 为每个面元创建新的、带偏移的索引
+                v_idx = face
+                idx = [(v + current_v_offset + 1) for v in v_idx] # OBJ 索引从1开始
+                f.write(f"f {idx[0]} {idx[1]} {idx[2]}\n")
+            # 更新当前对象的偏移量，为写入下一个对象做准备
+            current_v_offset += len(obj_data['vertices'])
+            f.write("\n")
+
+    #print(f"Saved {len(params_list)} cylinders to {obj_file}")
+    return
+
+#just save cyns.
+def save_auto_labeling_format_zhh(cyn, pc, dir_output, id_dir, id_cluster, firstTime):
+    # 常量定义
+    COLOR_INLIER = [255, 0, 0]    # 红色：内点
+    COLOR_OUTLIER = [0, 0, 255]   # 蓝色：外点
+    COLOR_IGNORE = [0, 255, 0]    # 绿色：忽略点
+
+    colors = np.zeros((len(pc), 3), dtype=np.uint8)  # 默认黑色 [0,0,0]
+    output_data = np.hstack((pc[:, :3], colors))  # 只保留坐标和颜色列
+
+    # 保存文件
+    save_dir = f'{now.month}_{now.day}_{now.hour}_{now.minute}_res_norm_debug'
+    os.makedirs(os.path.join(dir_output, save_dir), exist_ok=True)
+    base_path = os.path.join(dir_output, f'{save_dir}/{id_dir}_{id_cluster}_{firstTime}')
+
+    np.savetxt(f"{base_path}.txt",output_data,fmt="%.6f %.6f %.6f %d %d %d",  # 坐标+颜色
+        header="X Y Z R G B",comments="")
+
+    to_obj_cylinders([cyn,],f"{base_path}.obj",segments=16,centerline=False)
+    return 0
+
+def save_auto_labeling_format(cyn, pc, inlier, dir_output, id_dir, id_cluster, i_slc, firstTime):
+#revised from format_and_save_for_checking (gt_correction_zhh.py)
+    # 常量定义
+    COLOR_INLIER = [255, 0, 0]    # 红色：内点
+    COLOR_OUTLIER = [0, 0, 255]   # 蓝色：外点
+    COLOR_IGNORE = [0, 255, 0]    # 绿色：忽略点
+
+    # 提取半径并初始化输出数据
+    colors = np.zeros((len(pc), 3), dtype=np.uint8)  # 默认黑色 [0,0,0]
+    output_data = np.hstack((pc[:, :3], colors))  # 只保留坐标和颜色列
+
+    # 处理每个结果单元
+    params = []
+    if cyn is not None:
+        if isinstance(cyn, list):  params.extend(cyn)
+        else: params.append(cyn)
+    # 设置颜色（修正索引）
+    if inlier is not None:
+        if isinstance(inlier, list):
+            if len(inlier)>0: output_data[np.concatenate(inlier), 3:] = COLOR_INLIER
+        else: output_data[inlier, 3:] = COLOR_INLIER
+    #output_data[res['ind_outlier'], 3:] = COLOR_OUTLIER
+    #output_data[res['ind_ignore'], 3:] = COLOR_IGNORE
+
+    # 保存文件
+    save_dir = f'{now.month}_{now.day}_{now.hour}_{now.minute}_res_norm' if params else f'{now.month}_{now.day}_{now.hour}_{now.minute}_res_none'
+    os.makedirs(os.path.join(dir_output, save_dir), exist_ok=True)
+    base_path = os.path.join(dir_output, f'{save_dir}/{id_dir}_{id_cluster}_{i_slc}_{firstTime}')
+    # 保存点云TXT
+    np.savetxt(f"{base_path}.txt",output_data,fmt="%.6f %.6f %.6f %d %d %d",  # 坐标+颜色
+        header="X Y Z R G B",comments="")
+
+    # 保存圆柱体OBJ（如果存在）
+    if params: to_obj_cylinders(params,f"{base_path}.obj",segments=16,centerline=False)
+    return 0
+
+#is_diff_dir: True表示lst里的圆柱不是相同方向的(针对gt_dir不完全的情况), False是原来的情况(lst里所有圆柱都是同一方向的).
+def cluster_cyn_sub(lst_cyns, lst_pc, thr_centerline_dist, is_diff_dir, logger): #聚类圆柱.
+    lst_cluster = []
+    cnt_nodes = len(lst_cyns)
+    if for_debug or cnt_nodes<10000:
+        if logger: logger.debug(f"start single thread find edge")
+        dict_connected, deg_nodes = find_edges(lst_cyns, lst_pc, is_diff_dir, thr_centerline_dist)
+        #deg_nodes是每个node的度(即每个node连着多少条边)。a list.
+        #dict_connected: key是node_id, value是一个list，记录所有和key有边相连的node。
+        #deg_nodes: a list, 每个node的度.
+        if logger: logger.debug(f"finish single thread find edge")
+    else: #比较多的时候，用多进程版本. 因为wait的成本似乎挺高.
+        if logger: logger.debug(f"start multi thread find edge")
+        dict_connected, deg_nodes = find_edges_multiproc(lst_cyns, lst_pc, is_diff_dir, thr_centerline_dist)
+        if logger: logger.debug(f"finish multi thread find edge")
+    #验证单线程和多进程结果一样.
+    #for i in range(len(dict_connected)):
+    #    set1, set2 = set(dict_connected[i]), set(dict_connected2[i])
+    #    if not (set1 == set2):
+    #        pdb.set_trace()
+
+    sorted_indices_desc = [index for index, value in sorted(enumerate(deg_nodes), key=lambda item: item[1], reverse=True)] #排序，度高的放前面.
+    sorted_indices_desc.append(cnt_nodes)  #哨兵.
+    visited = [False,]*(cnt_nodes+1) #
+    lst_cluster = []
+    i = 0
+    while i<cnt_nodes:
+        while visited[sorted_indices_desc[i]]: i += 1
+        if i>=cnt_nodes: break
+        #找到一个root点.
+        node = sorted_indices_desc[i]
+        i += 1 #下一次的起点
+        cluster_cyn, visited[node], curr = [node,], True, 0 #初始化一个cyn cluster. cluster_cyn实际是队列，curr是其idx.
+        while curr<len(cluster_cyn): #BFS.
+            root, old_len = cluster_cyn[curr], len(cluster_cyn)
+            curr += 1
+            for node in dict_connected[root]:
+                if not visited[node]:
+                    visited[node] = True
+                    cluster_cyn.append(node)
+        #one cluster finished.
+        lst_cluster.append(cluster_cyn)
+        #get pts.
+        #pc = get_pc_of_cyns(args.path_cyns, [lst_cyns[i] for i in cluster_cyn], merge_pc=True)
+        #lst_pc.append(pc)
+    return lst_cluster#, lst_pc #
+
+def make_direction_consistent(lst_direction, idx_ref):
+    dir_ref = lst_direction[idx_ref]
+    for i in range(len(lst_direction)):
+        val = np.dot(lst_direction[i], dir_ref)
+        if val<0: lst_direction[i] = -lst_direction[i]
+    return
+
+#用length作为权重，来求lst_radius的平均。太短的就忽略.
+def get_length_weighted_average(lst_radius, len_all, len_max):
+    len_thr = THR_MIN_LEN_FOR_MEAN_RAD*len_max
+    cnt, len_sum, rad_sum = 0, 0, 0
+    for i in range(len(lst_radius)):
+        if len_all[i]>len_thr:
+            cnt += 1
+            len_sum += len_all[i]
+            rad_sum += lst_radius[i]*len_all[i]
+    assert len_sum>0, f'error for weighted average. list radius is {lst_radius}'
+    return rad_sum/len_sum
+
+#id_dir: gt_dir identifier, or UNKNOWN_DIR.
+def merge_cyn_params(lst_cyns_full, cluster_cyn, id_dir, firstTime):
+    lst_cyn = [lst_cyns_full[i] for i in cluster_cyn]
+    len_all = [i['length'] for i in lst_cyn]
+    idx = np.array(len_all).argmax()
+    if 1: #firstTime: #第一次时候，所有cyn统一看待. todo: 感觉这里不需要区分firstTime.
+        lst_radius = [i['radius'] for i in lst_cyn]
+        #radius_gt = np.mean(lst_radius)
+        radius_gt = get_length_weighted_average(lst_radius, len_all, len_all[idx])
+        if id_dir<UNKNOWN_DIR: 
+            direction_gt = lst_cyn[0]['direction'] #all directions are the same.
+        else:
+            lst_direction = [i['direction'] for i in lst_cyn]
+            make_direction_consistent(lst_direction, idx)
+            direction_gt = np.mean(lst_direction, axis=0)  
+        return direction_gt, radius_gt
+    else: #之后的话，直接取最长的那个cyn.
+        return lst_cyn[idx]['direction'], lst_cyn[idx]['radius']
+
+def merge_pc_clusters(lst_pcs, cluster_cyn): #把cluster_cyn的那些点云合并起来.
+    if cluster_cyn is None or len(cluster_cyn)==0: return None
+    if len(cluster_cyn)==1: return [lst_pcs[cluster_cyn[0]]]
+    lst = [lst_pcs[i] for i in cluster_cyn]
+    return lst
+
+def get_fitting_cnt(lst_cluster, firstTime):  #实际需要做cyn fitting的次数.
+    if firstTime: return len(lst_cluster)
+    else:
+        cnt = 0
+        for cluster_cyn in lst_cluster:
+            if len(cluster_cyn)>1: cnt += 1
+        return cnt
+
+#lst_cyn_fitted是用cluster_cyn merge起来fit的圆柱。
+def set_cluster_uid(lst_cyn_fitted, cluster_cyn, lst_cyns):
+    merged_uid = []
+    for i in cluster_cyn:
+        cyn_uid = lst_cyns[i]['unified_id']
+        if isinstance(cyn_uid, list): merged_uid.extend(cyn_uid)
+        else: merged_uid.append(cyn_uid)
+
+    merged_uid = list(set(merged_uid))  #去重.
+
+    for cyn in lst_cyn_fitted: 
+        if cyn is not None: cyn['unified_id'] = merged_uid
+    return
+
+def cluster_cyn_api_single(i, lst_cluster, lst_pc, lst_cyns, id_dir, firstTime, logger):
+    """
+    use multi proc,
+    :param i:
+    :param lst_cluster:
+    :param pc:
+    :param lst_cyns:
+    :param id_dir:
+    :param firstTime:
+    :return:
+    """
+    pc = np.vstack(lst_pc)
+    cluster_cyn = lst_cluster[i]
+    if logger: logger.debug(f"process cluster {cluster_cyn}")
+    assert len(cluster_cyn)>=1, 'error. wrong for cluster cyn len'
+    direction, radius = merge_cyn_params(lst_cyns, cluster_cyn, id_dir, firstTime)
+    if logger: logger.debug(f"direction [{direction[0]:.3f}, {direction[1]:.3f}, {direction[2]:.3f}], radius gt {radius:.3f}")
+    
+    #1124: 直接使用gt dir.  使用一伟1124的新版本后，还是用pred dir更好一些. 结果见孟传1124的email.
+    #if id_dir<len(gt_directions): direction = gt_directions[id_dir]
+
+    if len(cluster_cyn)>1 or firstTime: #第一次总是要重新估计，之后只在多个聚类到一起的时候才估计
+        lst_cyn_fitted, lst_ind_inlier = fit_cyn(direction, radius, pc, logger)
+        set_cluster_uid(lst_cyn_fitted, cluster_cyn, lst_cyns)
+        lst_inlier = [pc[ind_inlier] for ind_inlier in lst_ind_inlier]
+        for i_slc in range(len(lst_cyn_fitted)):
+            save_auto_labeling_format(lst_cyn_fitted[i_slc], pc, lst_ind_inlier[i_slc], PATH_OUTPUT, id_dir, i, i_slc, firstTime)
+    else:
+        lst_cyn_fitted = [lst_cyns[cluster_cyn[0]]] #直接用现有的cyn.
+        lst_inlier = lst_pc
+    return lst_cyn_fitted, lst_inlier, cluster_cyn
+
+
+def process_batch(lst_args):
+    global g_func
+    return [g_func(*arg) for arg in lst_args]
+
+
+def callback_multiprocessing(func, lst_args, n_proc, desc='', batch_size=50, n_batch=0, init_worker=None, initargs=None):
+    global g_func
+    g_func = func
+
+    if n_batch != 0:
+        batch_size = len(lst_args) // n_batch + 1
+
+    # Batch size of progress bar.
+    lst_idx = np.arange(0, len(lst_args), batch_size)
+    lst_idx = np.append(lst_idx, len(lst_args))
+    batches = [lst_args[lst_idx[i]: lst_idx[i + 1]] for i in range(len(lst_idx) - 1)]
+    assert sum([len(i) for i in batches]) == len(lst_args)
+
+    # batches = np.array_split(lst_args, len(lst_args) // batch_size + 1)
+    res = []
+    with tqdm(total=len(lst_args), desc=desc) as pbar:
+        with multiprocessing.Pool(
+            processes=n_proc,
+            initializer=init_worker,
+            initargs=(initargs,),
+        ) as pool:
+            # imap_unordered 更高效
+            for batch_result in pool.imap_unordered(process_batch, batches):
+                res.extend(batch_result)
+                pbar.update(len(batch_result))
+    return res
+
+def compute_confidence_single(i):
+    """
+    20251120, mcwei, compute confidence.
+    :return:
+    """
+    global g_lst_cyn, g_lst_pc
+    cyn = g_lst_cyn[i]
+    pc = g_lst_pc[i]
+    start = cyn['start']
+    end = cyn['end']
+    radius = cyn['radius']
+
+    res = {i: {}}
+    for confidence in LST_CONFIDENCE:
+        res[i][confidence]=eval(f'get_{confidence}')(pc, start, end, radius)
+    return res
+
+
