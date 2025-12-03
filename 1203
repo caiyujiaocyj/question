@@ -1,2 +1,751 @@
- python evaluation_global_L15.py --results_path_merge /media/samsung/samsung/recons_res/res_zhh_1126_cyj1203/cylinder_fitting_1F_newclusterv2round2_a0.001_wo_R2C1st_wo_R2C2nd_wo_merge/ifc_merge/11_26_13_51/output4_cyns.pkl --strong_merge 
---root "/media/samsung/samsung/DigitalTwin2025/dataset/HQdata/mcwei_test/GTGen/15L_CSF/BIM_new/"
+"""
+Usage:
+python evaluation_mcwei.py --rel_dir_fitted cylinder_fitting_mcwei_20250929
+"""
+import argparse, ast, importlib, json, os, random
+from typing import List
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn.functional as F
+import pickle
+import glob
+from multiprocessing import Pool
+from tqdm import tqdm
+
+def seed_torch(seed=0):
+	random.seed(seed)
+	os.environ['PYTHONHASHSEED'] = str(seed)
+	np.random.seed(seed)
+	torch.manual_seed(seed)
+	torch.cuda.manual_seed(seed)
+	torch.backends.cudnn.benchmark = True
+	torch.backends.cudnn.deterministic = True
+
+def ensemble_results(r_list:list):
+    results = {}
+    for res in r_list:
+        for x in res:
+            v = res[x]
+            if x in results:
+                results[x].append(v)
+            else:
+                results[x] = [v]
+    return results
+
+def load_json(pred_path):
+    with open(pred_path, 'r') as f:
+        pred_data = json.load(f)
+
+    # 转换为与 gt 相同的格式（移除 'id' 字段）
+    gt_format = []
+    for item in pred_data:
+        gt_format.append({
+            "start": np.array(item["start"]),
+            "end": np.array(item["end"]),
+            "radius": item["radius"],
+            "confidence": item["confidence"] if 'confidence' in item else 0.0
+        })
+    return gt_format
+
+def _clip(p0, p1, mn, mx):
+    t0, t1 = 0., 1.
+    d = p1 - p0
+    for i in range(3):
+        if abs(d[i]) < 1e-12:
+            if p0[i] < mn[i] or p0[i] > mx[i]: return None
+        else:
+            inv = 1. / d[i]
+            tE = (mn[i] - p0[i]) * inv
+            tL = (mx[i] - p0[i]) * inv
+            if tE > tL: tE, tL = tL, tE
+            t0 = max(t0, tE)
+            t1 = min(t1, tL)
+            if t0 > t1: return None
+    return p0 + t0 * d, p0 + t1 * d
+
+def clip_gt(gt, xyz, margin=.05,NRDK=True):
+    mn = xyz.min(0) - margin
+    mx = xyz.max(0) + margin
+    out = []
+    thinner_out = []
+
+    for g in gt.values():
+        if g['label'] == 'IfcFlowSegment-Rectangular-Duct':
+            print(g)
+            continue
+        v = {}
+        if args.confidence in g:
+            if isinstance(g[args.confidence], float):
+                v.update({args.confidence:g[args.confidence]})
+            else:
+                v.update({args.confidence:0.0})
+        else:
+            v.update({args.confidence:0.0})
+        g = g['extend_inf'] if NRDK else g
+        res = _clip(np.asarray(g['start']), np.asarray(g['end']), mn, mx)
+        if res is None: continue
+        s, e = res
+        if np.linalg.norm(np.subtract(s, e)) < 0.01: continue
+        v.update({'start': s, 'end': e, 'radius': g['radius']})
+
+        if g['radius']>0.02: # added
+            out.append(v)
+        else:
+            thinner_out.append(v)
+    # a,b = len(out),len(thinner_out)
+    # print(f'[GT]\tAll Pipes: {a+b}\n\tUsing Pipes:{a}\n\tThinner Pipes: {b}')
+
+    return out
+
+def load_xyz(path):
+    return np.load(path)[:, :3] if path.endswith('.npy') else np.loadtxt(path)[:, :3]
+
+def _ang(u, v):
+    u = u / (np.linalg.norm(u) + 1e-6)
+    v = v / (np.linalg.norm(v) + 1e-6)
+    return np.degrees(np.arccos(np.abs(np.clip(np.dot(u, v), -1, 1))))
+
+def segment_distance(p1, p2, q1, q2):
+    """
+    计算两条线段之间的最短距离@
+        https://math.stackexchange.com/questions/846054/closest-points-on-two-line-segments
+    参数:
+        p1, p2: 线段1的两个端点 [x, y, z]
+        q1, q2: 线段2的两个端点 [x, y, z]
+    返回:
+        两条线段之间的最短距离
+    """
+    # 转为numpy数组便于计算
+    p1 = np.asarray(p1)
+    p2 = np.asarray(p2)
+    q1 = np.asarray(q1)
+    q2 = np.asarray(q2)
+
+    # 计算方向向量
+    u = p2 - p1  # 线段1的方向向量
+    v = q2 - q1  # 线段2的方向向量
+    w = p1 - q1  # 从q1到p1的向量
+
+    # 计算点积
+    a = np.dot(u, u)  # ||u||²
+    b = np.dot(u, v)  # u·v
+    c = np.dot(v, v)  # ||v||²
+    d = np.dot(u, w)  # u·w
+    e = np.dot(v, w)  # v·w
+
+    # 分母 (向量平行判断依据)
+    denom = a * c - b * b
+
+    # 初始化参数
+    sc = sN = sD = denom
+    tc = tN = tD = denom
+
+    # 处理平行线段的情况 (denom接近0)
+    if denom < 1e-7:
+        sN = 0.0
+        sD = 1.0
+        tN = e
+        tD = c
+    else:
+        # 计算线段最近点参数
+        sN = (b * e - c * d)
+        tN = (a * e - b * d)
+
+        # 处理参数超出[0,1]范围的情况
+        if sN < 0.0:
+            sN = 0.0
+            tN = e
+            tD = c
+        elif sN > sD:
+            sN = sD
+            tN = e + b
+            tD = c
+
+    # 计算t参数
+    if tN < 0.0:
+        tN = 0.0
+        if -d < 0.0:
+            sN = 0.0
+        elif -d > a:
+            sN = sD
+        else:
+            sN = -d
+            sD = a
+    elif tN > tD:
+        tN = tD
+        if (-d + b) < 0.0:
+            sN = 0
+        elif (-d + b) > a:
+            sN = sD
+        else:
+            sN = -d + b
+            sD = a
+
+    # 计算最终参数值 (避免除以零)
+    sc = 0.0 if abs(sN) < 1e-7 else sN / sD
+    tc = 0.0 if abs(tN) < 1e-7 else tN / tD
+
+    # 计算最近点
+    P = p1 + sc * u
+    Q = q1 + tc * v
+
+    # 返回两点间距离
+    return np.linalg.norm(P - Q)
+
+def proc_match(data):
+    gi,pi,g,p,at = data
+    if _ang(p['end'] - p['start'], g['end'] - g['start']) > at:
+        return False,-1,-1
+    if segment_distance(p['start'],p['end'], g['start'],g['end']) > g['radius']:
+        return False,-1,-1
+    return True, pi,gi
+
+def divide_and_map(pred_all, len_pred_all, len_small_seg):
+    pred_small_seg, map_pred_to_small_seg = [], []
+    #dividing and mapping.
+    idx = 0
+    for i in range(len(pred_all)):
+        pred, len_pred = pred_all[i], len_pred_all[i]
+        cnt = int(len_pred/len_small_seg + 0.5)  #分成多少段.
+        if cnt==0: cnt = 1
+        len_each = len_pred/cnt #每小段的长度.
+        p1, v = np.asarray(pred['start']), np.subtract(pred['end'], pred['start'])
+        lst_pos = np.linspace(0, 1, cnt + 1)
+        map_pred_to_small_seg.append([idx, idx+cnt]) #pred_all中每个元素在pred_small_seg里的区间段，含头不含尾.
+        idx += cnt
+        for i in range(cnt):
+            def make_cyn(cyn_org, start_new, end_new): #todo: 有个'name'，是否要修改?
+                cyn = dict(cyn_org)
+                cyn['start'], cyn['end'] = start_new, end_new
+                return cyn
+            cyn = make_cyn(pred, p1+lst_pos[i]*v, p1+lst_pos[i+1]*v) #分成小段.
+            if 'length' in cyn: cyn['length'] = len_each
+            pred_small_seg.append(cyn)
+    return pred_small_seg, map_pred_to_small_seg
+
+def match_fast(pred: List[dict], gt: List[dict], dt=0.1, at=30, rr=0.25,fast=True,
+               enable_complete=False,cal_metrics=['recall','completeness','precision']):
+    """
+    Many‑to‑many: every pred–GT pair passing thresholds is a hit.
+    20251016, mcwei, Algorithm is same as the function 'match'. I use numpy to decrease time consumption.
+    """
+    n_gt = len(gt)
+    len_gt = [np.linalg.norm(np.subtract(i['start'], i['end'])) for i in gt]
+    gt = [gt[i] for i in range(n_gt) if len_gt[i] > 0.01]
+    gt_too_small = [gt[i] for i in range(n_gt) if len_gt[i] <= 0.01]
+    print(f'number of gt less than 0.01m: {n_gt - len(gt)}')  # For test set, 12 gts (len <= 0.01m) are removed. Length of 7 gts is 0.
+
+    matches,matches3 = [],[]
+    pred_hit = [False] * len(pred)
+    gt_hit = [False] * len(gt)
+    starts_pred = np.array([p['start'] for p in pred])  # (n_pred, 3)
+    ends_pred = np.array([p['end'] for p in pred])  # (n_pred, 3)
+    radii_pred = np.array([p['radius'] for p in pred])  # (n_pred,)
+    starts_gt = np.array([g['start'] for g in gt])  # (n_gt, 3)
+    ends_gt = np.array([g['end'] for g in gt])  # (n_gt, 3)
+    radii_gt = np.array([g['radius'] for g in gt])  # (n_gt,)
+
+    starts_pred = starts_pred[:, None, :]  # (n_pred, 1, 3)
+    ends_pred = ends_pred[:, None, :]  # (n_pred, 1, 3)
+    radii_pred = radii_pred[:, None]  # (n_pred, 1)
+    starts_gt = starts_gt[None, :, :]  # (1, n_gt, 3)
+    ends_gt = ends_gt[None, :, :]  # (1, n_gt, 3)
+    radii_gt = radii_gt[None, :]  # (1, n_gt)
+
+    centers_pred = (starts_pred + ends_pred) / 2
+    centers_gt = (starts_gt + ends_gt) / 2
+
+    # Pre-compute the distance between each gt pipe and pred pipe, and only consider the pairs that are near.
+    # matrix_dis = np.linalg.norm(centers_pred - centers_gt, axis=-1)  # (n_pred, n_gt)
+    dis_max = 1 * np.sqrt(3)  # unit is meter
+    len_pred = [np.linalg.norm(np.subtract(i['start'], i['end'])) for i in pred]
+    if 'len_precision' in cal_metrics:
+        pred_small_seg, map_pred_to_small_seg = divide_and_map(pred, len_pred, len_small_seg=0.02)
+
+    if fast:
+        gpu=True
+        if gpu:
+            radii_pred, radii_gt = torch.tensor(radii_pred).cuda(),torch.tensor(radii_gt).cuda()
+            centers_pred,centers_gt = torch.tensor(centers_pred).cuda(),torch.tensor(centers_gt).cuda()
+            starts_pred, ends_pred = torch.tensor(starts_pred).cuda(), torch.tensor(ends_pred).cuda()
+            starts_gt, ends_gt = torch.tensor(starts_gt).cuda(), torch.tensor(ends_gt).cuda()
+        # at_rad = np.deg2rad(at)
+
+        for pi, p in tqdm(enumerate(pred)):
+            cpred,cgt = centers_pred[pi][0], centers_gt[0]
+            s_pred,e_pred,s_gt,e_gt = starts_pred[pi][0],ends_pred[pi][0],starts_gt[0],ends_gt[0]
+            if gpu:
+                s_pred,e_pred,s_gt,e_gt = torch.tensor(s_pred).cuda(),torch.tensor(e_pred).cuda(),torch.tensor(s_gt).cuda(),torch.tensor(e_gt).cuda()
+                dis_max = torch.max(torch.linalg.norm(s_gt -  e_gt, dim=-1),torch.linalg.norm(s_pred -  e_pred, dim=-1))
+                dis_max = torch.max(dis_max,torch.tensor(1.).cuda())
+                # matrix_dis_ss = torch.linalg.norm(s_pred -  s_gt, dim=-1)
+                # matrix_dis_se = torch.linalg.norm(s_pred -  e_gt, dim=-1)
+                # matrix_dis_es = torch.linalg.norm(e_pred -  s_gt, dim=-1)
+                # matrix_dis_ee = torch.linalg.norm(e_pred -  e_gt, dim=-1)
+                # mask_center_dis = (matrix_dis_ss < dis_max) | (matrix_dis_se < dis_max) | (matrix_dis_es < dis_max) | (matrix_dis_ee < dis_max)
+                matrix_dis = torch.linalg.norm(cpred -  cgt, dim=-1)
+                mask_center_dis = (matrix_dis < dis_max)
+                mask_center_radius = (radii_pred[pi]-radii_gt).abs()/(radii_gt+1e-6) <=rr
+                mask = mask_center_dis & mask_center_radius[0]
+                # mask = mask_center_radius[0]
+                mask_ids = torch.where(mask)[0].cpu().numpy()
+            else:
+                # matrix_dis = np.linalg.norm(cpred -  cgt, axis=-1)
+                # matrix_dis = [m.item() for m in matrix_dis]
+                # mask_center_dis = (matrix_dis < dis_max)
+                mask_center_radius = abs(radii_pred[pi]-radii_gt)/(radii_gt+1e-6) <=rr
+                mask_center_radius = mask_center_radius[0]
+                # if enable_complete==False:
+                #     mask = mask_center_dis & mask_center_radius & (gt_hit==False)
+                # else:
+                # mask = mask_center_dis & mask_center_radius
+                mask = mask_center_radius
+                mask_ids = np.where(mask)[0]
+            if len(mask_ids)==0:
+                continue
+            mul_proc = False
+            if mul_proc:
+                # gt = np.array(gt)
+                mask_ids = mask_ids.tolist()
+                input = [[gi,pi,gt[gi],p,at] for gi in mask_ids]
+                with Pool(16) as p:
+                    r_list = list(p.imap(proc_match, input))
+                if len(r_list)<=0:
+                    continue
+                r_list = [[r[1],r[2]] for r in r_list if r[0]]
+                if len(r_list)<=0:
+                    continue
+                for r_idx in r_list:
+                    pi,gi = r_idx
+                    matches.append((pi, gi))
+                    pred_hit[pi] = True
+                    gt_hit[gi] = True
+            else:
+                for gi in mask_ids:
+                    if gt_hit[gi]==True and enable_complete: # Speed-Up for Recall computation
+                        continue
+                    g = gt[gi]
+                    if _ang(p['end'] - p['start'], g['end'] - g['start']) > at: continue
+                    # if segment_distance(p['start'],p['end'], g['start'],g['end'])  > dt: continue
+                    if segment_distance(p['start'],p['end'], g['start'],g['end']) > g['radius']: continue
+                    matches.append((pi, gi))
+                    pred_hit[pi] = True
+                    gt_hit[gi] = True
+                    if 'len_precision' in cal_metrics:
+                        id_start, id_end = map_pred_to_small_seg[pi]
+                        for ii in range(id_start, id_end): #每一个pred_small_seg.
+                            p3 = pred_small_seg[ii]
+                            if segment_distance(p3['start'],p3['end'], g['start'],g['end']) <= g['radius']:
+                                matches3.append((ii, gi))
+    else:
+        for pi, p in tqdm(enumerate(pred)):
+            matrix_dis = np.linalg.norm(centers_pred[pi][0] -  centers_gt[0], axis=-1)
+            for gi, g in enumerate(gt):
+                if gt_hit[gi]==True and enable_complete: # Speed-Up for Recall computation
+                    continue
+                # if not np.linalg.norm(centers_pred[pi][0] -  centers_gt[0][gi]) < dis_max: continue
+                # if not matrix_dis[pi, gi] < dis_max: continue
+                if not matrix_dis[gi] < dis_max: continue
+                # print('Here:',p['radius'],g['radius'])
+                if abs(p['radius']-g['radius'])/(g['radius']+1e-6)>rr: continue
+                if _ang(p['end'] - p['start'], g['end'] - g['start']) > at: continue
+                # if segment_distance(p['start'],p['end'], g['start'],g['end'])  > dt: continue
+                if segment_distance(p['start'],p['end'], g['start'],g['end']) > g['radius']: continue
+                matches.append((pi, gi))
+                pred_hit[pi] = True
+                gt_hit[gi] = True
+    un_pred = [i for i, ok in enumerate(pred_hit) if not ok]
+    un_gt = [i for i, ok in enumerate(gt_hit) if not ok]
+    if 'len_precision' in cal_metrics:
+        return matches, un_pred, un_gt,matches3,pred_small_seg
+    return matches, un_pred, un_gt,None,None
+
+def metrics(pred, gt, m):
+    """
+    计算管道检测任务的评估指标（精度、召回率、几何误差等）
+
+    参数:
+        pred (list): 预测的管道列表，每个元素是包含 'start', 'end', 'radius' 的字典
+        gt (list): 真实管道列表，格式同 pred
+        m (set): 匹配集合，元素为 (pred_idx, gt_idx) 的元组，表示匹配的预测-真实管道对
+
+    返回:
+        dict: 包含以下指标的字典:
+            - 分类指标: precision, recall, f1, tp, fp, fn
+            - 几何误差: mean_end_dist, mean_ang_deg, mean_rad_err
+            - 长度指标: completeness, len_precision
+    """
+    # True Positives (TP): 成功匹配的管道数量
+    tp_gt = len(set(i for _,i in m))
+    tp_pred = len(set(i for i,_ in m))
+    # False Positives (FP): 预测的管道中未匹配的数量
+    fp = len(pred) - tp_pred
+    # False Negatives (FN): 真实管道中未匹配的数量
+    fn = len(gt) - tp_gt
+    # 精度 = TP / (TP + FP)  避免除零加1e-8
+    prec = tp_pred / (len(pred) + 1e-8)
+    # 召回率 = TP / (TP + FN)
+    rec = tp_gt / (len(gt) + 1e-8)
+    # F1分数 = 2 * (precision * recall) / (precision + recall)
+    f1 = 2 * prec * rec / (prec + rec + 1e-8)
+
+    # 几何误差指标（仅计算匹配的管道对）
+    if tp_pred:
+        # 平均端点距离：匹配管道的起点/终点间的平均欧氏距离
+        dist = np.mean([segment_distance(pred[i]['start'], pred[i]['end'],gt[j]['start'],gt[j]['end']) for i, j in m])
+
+        # 平均角度误差：匹配管道的方向向量之间的平均角度差（度）
+        ang = np.mean([_ang(pred[i]['end'] - pred[i]['start'],
+                            gt[j]['end'] - gt[j]['start']) for i, j in m])
+
+        # 平均半径误差：匹配管道的半径绝对差均值
+        rad = np.mean([abs(pred[i]['radius'] - gt[j]['radius']) for i, j in m])
+    else:
+        # 无匹配时设为NaN
+        dist = ang = rad = float('nan')
+
+    # 总长度指标
+    m_gt = set([g for _, g in m])
+    m_pred = set([p for p, _ in m])
+    # 真实管道总长度（用于计算completeness）
+    tl = sum(np.linalg.norm(g['end'] - g['start']) for g in gt)
+    # 已匹配的真实管道总长度
+    ml = sum(np.linalg.norm(gt[j]['end'] - gt[j]['start']) for j in m_gt)
+    # 预测管道总长度（用于计算len_precision）
+    pred_len = sum(np.linalg.norm(p['end'] - p['start']) for p in pred)
+    # 已匹配的预测管道总长度（修正后的计算）
+    match_len = sum(np.linalg.norm(pred[j]['end'] - pred[j]['start']) for j in m_pred)
+
+    return {
+        # 分类指标
+        'precision': prec,  # 预测管道的匹配准确率
+        'recall': rec,  # 真实管道的检出率
+        'f1': f1,  # 综合指标
+        'tp': tp_gt,  # 正确匹配数量
+        'fp': fp,  # 误报数量
+        'fn': fn,  # 漏报数量
+        # 几何误差
+        'mean_end_dist': dist,  # 端点位置平均误差（单位同坐标）
+        'mean_ang_deg': ang,  # 方向角度平均误差（度）
+        'mean_rad_err': rad,  # 半径平均误差（单位同半径）
+        # 长度覆盖率指标
+        'completeness': ml / (tl + 1e-8),  # 真实管道长度的匹配比例
+        'ml': ml,
+        'tl': tl,
+        'len_precision': match_len / (pred_len + 1e-8)  # 预测管道长度的有效比例
+    }
+
+def length_group(gt, L=0.1):
+    grouped_gt = []
+    for gt_i in tqdm(gt):
+        start,end,radius = [gt_i[x] for x in ['start','end','radius']]
+        v = end-start
+        total_len = np.linalg.norm(v)
+        direction = v / total_len
+        current_len = 0.0
+        while current_len < total_len:
+            next_len = min(current_len+L, total_len)
+            p1 = start + direction*current_len
+            p2 = start + direction*next_len
+            grouped_gt.append(
+                {'start': p1, 'end': p2, 'radius': radius}
+            )
+            current_len = next_len
+    return grouped_gt
+
+def split_sets(files):
+    low_quality_areas = np.array([
+        "block_1Ftest_12_0_1.pts.json", "block_1Ftest_13_0_1.pts.json", "block_1Ftest_5_0_1.pts.json", "block_1Ftest_5_2_1.pts.json", "block_1Ftest_6_10_0.pts.json", "block_1Ftest_6_11_2.pts.json", "block_1Ftest_6_2_2.pts.json", "block_1Ftest_7_10_2.pts.json", "block_1Ftest_7_12_1.pts.json", "block_1Ftest_7_2_2.pts.json",
+        "block_1Ftest_12_0_2.pts.json", "block_1Ftest_13_0_2.pts.json", "block_1Ftest_5_0_2.pts.json", "block_1Ftest_5_2_2.pts.json", "block_1Ftest_6_10_1.pts.json", "block_1Ftest_6_1_1.pts.json", "block_1Ftest_7_0_1.pts.json", "block_1Ftest_7_11_1.pts.json", "block_1Ftest_7_1_2.pts.json",
+        "block_1Ftest_12_1_1.pts.json", "block_1Ftest_13_1_1.pts.json", "block_1Ftest_5_1_1.pts.json", "block_1Ftest_6_0_1.pts.json", "block_1Ftest_6_10_2.pts.json", "block_1Ftest_6_1_2.pts.json", "block_1Ftest_7_0_2.pts.json", "block_1Ftest_7_11_2.pts.json", "block_1Ftest_7_2_0.pts.json",
+        "block_1Ftest_12_1_2.pts.json", "block_1Ftest_13_1_2.pts.json", "block_1Ftest_5_1_2.pts.json", "block_1Ftest_6_0_2.pts.json", "block_1Ftest_6_11_1.pts.json", "block_1Ftest_6_2_1.pts.json", "block_1Ftest_7_10_1.pts.json", "block_1Ftest_7_1_1.pts.json", "block_1Ftest_7_2_1.pts.json"
+        ])
+    goodset, badset = [], []
+    items = [xx[1].split('/')[-1] for xx in files] #block_1Ftest_12_0_1.pts.json, as in low_quality_areas
+    for i in range(len(items)):
+        if items[i] in low_quality_areas: badset.append(files[i])
+        else: goodset.append(files[i])
+    #assert len(badset)==len(low_quality_areas), 'error. some low quality block not found'
+    not_found = []
+    for area in low_quality_areas:
+        if area not in items: not_found.append(area)
+    print(f"some low quality area not found: {not_found}")
+    return {'all set':files, 'good set':goodset, 'bad set':badset}
+
+
+def proc_get_gt(file):
+    cloud_path, pred_path = file
+    xyz = load_xyz(cloud_path)
+    xyz = [xyz[:, :3].min(0).tolist(),xyz[:, :3].max(0).tolist()]
+    return {cloud_path:xyz}
+
+def auto_split_sets(files, input_infos,low_quality_coverage=0.2, recompute = False):
+    root = os.path.dirname(files[0][0])
+    blocks = {}
+    saved_coverage_file = os.path.join(root,f'blocks_{low_quality_coverage:.3f}.json')
+    saved_coverage_file_latest = os.path.join(root,f'blocks_latest.json')
+
+    # files = files[:50]
+    xyz_loaded = False
+    if os.path.isfile(saved_coverage_file):
+        xyz_loaded = True
+        blocks_xyz = json.load(open(saved_coverage_file))
+    elif os.path.isfile(saved_coverage_file_latest):
+        xyz_loaded = True
+        blocks_xyz = json.load(open(saved_coverage_file_latest))
+    if recompute==False:
+        assert(xyz_loaded)
+        return {
+            'all set':files, #blocks_xyz['good set']+blocks_xyz['bad set'],
+            'good set':blocks_xyz['good set'],
+            'bad set':blocks_xyz['bad set']
+        }
+    mul_proc = True
+    r_dict_xyz ={}
+    if mul_proc and xyz_loaded==False:
+        with Pool(16) as p:
+            r_list_xyz = list(p.imap(proc_get_gt, files))
+            [r_dict_xyz.update(d) for d in r_list_xyz]
+    for file in tqdm(files):
+        cloud_path, pred_path = file
+        if xyz_loaded:
+            xyz = blocks_xyz[cloud_path]['xyz']
+        else:
+            if cloud_path in r_dict_xyz:
+                xyz = r_dict_xyz[cloud_path]
+            else:
+                xyz = load_xyz(cloud_path)
+                xyz = [xyz[:, :3].min(0).tolist(),xyz[:, :3].max(0).tolist()]
+        gt = clip_gt(input_infos, np.array(xyz),margin=0.0)
+        # gt = [gt_i[args.confidence] for gt_i in gt if isinstance(gt_i[args.confidence],float)] # remove Nan Coverage
+        if len(gt) == 0:
+            coverage = 0.0
+        else:
+            try:
+                coverage = np.around(np.array([gt_i[args.confidence] for gt_i in gt]).mean(),3).item()
+            except Exception as e:
+                print(f'Failed process: {file} @auto_split')
+                coverage = 0.0
+        blocks.update({
+            cloud_path:{
+                'xyz':xyz,
+                args.confidence:coverage,
+                'pred_path': pred_path
+                }})
+
+    goodset = [[k,v['pred_path']] for k,v in blocks.items() if v[args.confidence]>low_quality_coverage]
+    badset = [[k,v['pred_path']] for k,v in blocks.items() if v[args.confidence]<=low_quality_coverage]
+    blocks.update(
+        {
+        'low_quality_coverage':low_quality_coverage,
+        'good set':goodset,
+        'bad set':badset
+        })
+    with open(saved_coverage_file, 'w') as f:
+        json.dump(blocks, f, indent=4)
+    with open(saved_coverage_file_latest, 'w') as f:
+        json.dump(blocks, f, indent=4)
+    # print([[a,b] for a,b in zip(files, badset+goodset)if a!=b])
+    return {
+        'all set':files, #goodset+badset,
+        'good set':goodset,
+        'bad set':badset
+        }
+
+
+def get_pred_and_gt(files, input_infos,split_scenario=False,low_quality_coverage=0.2,confidence=0.0, merged=False):
+    pred_all = []
+    gt = []
+    bboxes = []
+    if merged:
+        print(f'Loading merged prediction results: {files[1]}')
+        def load_merged_pred(merged_pred_path):
+            pred = pickle.load(open(merged_pred_path, 'rb'))
+            pred_filter = [aa for aa in pred if aa.get('name', '')!= '-1']
+            return pred_filter
+        pred_all = load_merged_pred(files[1])
+    else:
+        try:
+            root = os.path.dirname(files[0][0])
+        except:
+            print(f"root:{root}")
+        saved_coverage_file = os.path.join(root,f'blocks_{low_quality_coverage:.3f}.json')
+        if os.path.isfile(saved_coverage_file):
+            blocks = json.load(open(saved_coverage_file))
+        mn,mx = [+1e7]*3,[-1e7]*3
+        for file in tqdm(files):
+            cloud_path, pred_path = file
+            try:
+                if split_scenario:
+                    if os.path.isfile(saved_coverage_file):
+                        xyz = np.array(blocks[cloud_path]['xyz'])
+                    else:
+                        xyz = load_xyz(cloud_path)
+                    mn = np.min([mn,xyz.min(0)],axis=0)
+                    mx = np.max([mx, xyz.max(0)],axis=0)
+                    gt_i = clip_gt(input_infos, xyz,margin=0.0)
+                    gt += gt_i
+                pred = load_json(pred_path)
+                if confidence>0.0:
+                    pred = [p for p in pred if p['confidence']>=confidence]
+                if len(pred)>0:
+                    pred_all.extend(pred)
+            except Exception as e:
+                pass
+        bboxes = np.array([mn, mx])
+
+    if split_scenario and merged==False:
+        bboxes = np.array([mn, mx])
+    else:
+        # test_area =[[64.18,45.40,9.39,2.06962356e+05,5.14704749e+05,8.87532250e+01],
+        #     [62.75,39.77,6.24,2.06961839e+05,5.14701823e+05,9.48962450e+01]]
+        bboxes = np.array(((-1e9, -1e9, -1e9), (1e9, 1e9, 1e9)))
+        # bboxes = np.array([
+        #     [6.50490e+01, 9.30030e+01, 2.00000e-03],
+        #     [1.29049e+02, 1.29706e+02, 1.28160e+01]
+        # ])
+        gt = clip_gt(input_infos, bboxes, margin=0.0)
+        # gt = length_group(gt, L=0.1)
+    print(bboxes)
+    print(f"[Pred]\tLength: {np.sum([np.linalg.norm(p['end'] - p['start']) for p in pred_all])}")
+    print(f"[GT]\tLength: {np.sum([np.linalg.norm(g['end'] - g['start']) for g in gt])}")
+    print(f'[Pred]\tAll Pipes: {len(pred_all)}')
+    print(f'[GT]\tAll Pipes: {len(gt)}')
+    return pred_all, gt
+
+
+def proc_dataset(files, input_infos, split_scenario=False,low_quality_coverage=0.2,confidence=0.0,cal_metrics = ['recall','completeness','precision'],enable_complete=False):
+    r_list = []
+    pred_all, gt = get_pred_and_gt(files, input_infos,split_scenario,low_quality_coverage,confidence,merged='.pkl' in files[1])
+    def eval_global(pred_all, gt,enable_complete):
+        m, up, ug, m3,pred_small_seg = match_fast(pred_all, gt, dt=0.10, at=10, rr=0.2,enable_complete=enable_complete, cal_metrics=cal_metrics)
+
+        # 20251113, mcwei, save matching results for visualization and analysis.
+        path_tmp = os.path.join(os.path.dirname(files[-1]), f'eval_{os.path.basename(files[-1])}')
+        tmp = dict(gt=gt, up=up, ug=ug)  # todo: 确定 up 能够直接索引 output4_cyns.pkl 和 output4_inliers.pkl
+        pickle.dump(tmp, open(path_tmp, 'wb'))
+
+        met = metrics(pred_all, gt, m)
+        if 'len_precision' in cal_metrics:
+            met['len_precision'] = metrics(pred_small_seg, gt, m3)['len_precision']
+        return met
+    r_list = [eval_global(pred_all, gt,enable_complete)]
+    results = ensemble_results(r_list) # for mul-proc support
+    top_percentage = 1.0
+    num = int(np.array(results['recall']).shape[0]*top_percentage)
+    cal_results = [(np.sort(np.array(results[x]))[-num:]).mean() for x in cal_metrics]
+    # [print(f'{x}:{cal_results[i]:.3f}') for i,x in enumerate(cal_metrics)]
+    return {x:cal_results[i] for i,x in enumerate(cal_metrics)}
+
+def proc_evaluation(inputs):
+    args, enable_complete = inputs
+    root = args.root #'/media/34.92/common-data-32t/data/DigitalTwin2025/dataset/HQData_2nd/yw_0612/v2_2_0820-2/'
+    if not enable_complete: # instance-level precision
+        # infos_path = os.path.join(root,"P&D.pkl")
+        # infos = pickle.load(open(infos_path,'rb')).item()
+        # infos_path = os.path.join(root,"P&D_valid.pkl")
+        infos_path = os.path.join(root, args.rel_path_gt) # w/o _all -> 1F only
+        infos = pickle.load(open(infos_path,'rb'))
+    else:
+        infos_path = os.path.join(root, args.rel_path_gt)
+        infos_path_new = os.path.join(root, args.rel_path_seg_gt) #"P&D_segment_gt_0.050_10_True_10_20_15_44.pkl"
+        infos = pickle.load(open(infos_path_new,'rb'))
+
+    if isinstance(infos, list):
+        infos = {i: infos[i] for i in range(len(infos))}
+
+    confidence = args.instance_confidence_thr
+    if args.strong_merge:
+        all_files = [None, args.results_path_merge]
+    else:
+        results_path =  args.results_path
+        preds = glob.glob(os.path.join(results_path, args.rel_dir_fitted, "*1F*.json")) #pred
+        all_files = [[os.path.join(results_path,pred.split('/')[-1].replace('.json','')),pred] for pred in preds]
+
+    th_bad_set = args.th_bad_set
+    if not args.quality_based_areas:
+        testset ={'all set':all_files}
+    else:
+        th_bad_set = args.th_bad_set #0.1
+        print(f'low quality coverage: {th_bad_set}')
+        testset = auto_split_sets(all_files, infos,low_quality_coverage=th_bad_set, recompute=not enable_complete) if args.block_coverage else split_sets(all_files)
+
+    for setname,files in testset.items():
+        print(f'\n------------ Test {setname}------------')
+        cal_metrics = ['completeness'] if enable_complete else ['recall','precision','len_precision']
+        rets = []
+        if args.instance_coverage: # instance level
+            higher_than_coverage_thr = args.instance_coverage_list #[0.0, 0.05,0.10,0.15,0.20,0.25,0.5,0.75] #THR_COVERAGE
+            for thr in higher_than_coverage_thr:
+                print(f'[Coverage range>={thr}')
+                input_infos = {}
+                # 'infos' contains paramerters of GT Pipe
+                if enable_complete:
+                    infos_org = pickle.load(open(infos_path,'rb'))
+                    if isinstance(infos_org, list):
+                        infos_org = {i: infos_org[i] for i in range(len(infos_org))}
+                    reserved_id = [v['ins_label'] for k,v in infos_org.items() if v.get(args.confidence, 1.)>=thr]
+                    for k,v in infos.items():
+                        if v['ins_label']// 100 in reserved_id:
+                            input_infos.update({k:v})
+                else:
+                    for k,v in infos.items():
+                        if v.get(args.confidence, 1.)>=thr:
+                            input_infos.update({k:v})
+                infos = input_infos
+                rets.append(proc_dataset(files,infos,setname!='all set',low_quality_coverage=th_bad_set,
+                                         confidence=confidence, cal_metrics = cal_metrics,enable_complete=enable_complete))
+        else:
+            rets.append(proc_dataset(files,infos,setname!='all set',low_quality_coverage=th_bad_set,
+                                confidence=confidence, cal_metrics = cal_metrics,enable_complete=enable_complete))
+        return rets
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='evaluation')
+
+    #first: from yiwei; second, from zhh (34.66). TODO: check 0820-2 vs. 0820，有区别吗？
+    #parser.add_argument('--root', default='/media/34.92/common-data-32t/data/DigitalTwin2025/dataset/HQData_2nd/yw_0612/v2_2_0820-2/', type=str, help='the relative dir name of fitted cylinder')
+    parser.add_argument('--root', default='data/HQdata/mcwei_test/GTGen/15L_CSF/BIM_new/', type=str, help='Root directory of GT.')
+    parser.add_argument('--rel_path_gt', default='P&D_seg1.0.pkl', type=str, help='relative directory of GT.')
+    parser.add_argument('--rel_path_seg_gt', default='P&D_seg0.02.pkl', type=str, help='relative directory of GT.')
+
+    #下面两行，是测试merge前的结果. zhh: 我没有使用.
+    parser.add_argument('--results_path', default='exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/', type=str, help='path to checkpoint')# for org results, json
+    parser.add_argument('--rel_dir_fitted', default='cylinder_fitting_1F_wo_merge', type=str, help='the relative dir name of fitted cylinder')
+
+    #下面这行，是测试merge后的结果.对应于我原来用的FNAME_MERGE. zhh: 测试ok, on 34.66.
+    #parser.add_argument('--results_path_merge', default='exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/10_24_19_15/output3_cyns.pkl', type=str, help='path to checkpoint')# for results from strong_merge, pkl
+    parser.add_argument('--results_path_merge', default='/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/cylinder_fitting_wo_merge__11_14_17_56/ifc_merge/11_18_8_57/output3_cyns.pkl', type=str, help='path to checkpoint')
+
+    parser.add_argument('--th_bad_set', default=0.175, type=float, help='the relative dir name of fitted cylinder')
+    parser.add_argument('--instance_confidence_thr', default=-1.0, type=float, help='')
+    parser.add_argument('--instance_coverage', action='store_true', help='')
+    parser.add_argument('--instance_coverage_list', nargs='+', type=float, default=[0.0, 0.15],help='<Required> Set flag') #15%
+    parser.add_argument('--block_coverage', action='store_true', help='')
+    parser.add_argument('--quality_based_areas', action='store_true', help='')
+    parser.add_argument('--strong_merge', action='store_true', help='')
+    parser.add_argument('--mul_proc', action='store_true', help='')
+    parser.add_argument('--confidence', default='coverage', type=str, help='coverage or CCR')
+    parser.set_defaults(instance_coverage=True)
+    parser.set_defaults(block_coverage=False)
+    parser.set_defaults(quality_based_areas=False)
+    parser.set_defaults(strong_merge=True)
+    parser.set_defaults(mul_proc=True)
+    args = parser.parse_args()
+    if args.quality_based_areas:
+        assert(args.strong_merge) # quality based area partition only support fitting w/o strong merge
+
+    if args.mul_proc:
+        print('multiprocessing')
+        input = [[args,False],[args,True]]
+        with Pool(2) as p:
+            rets_1,rets_2 = list(tqdm(p.imap(proc_evaluation, input)))
+    else:
+        print('single thread processing')
+        rets_1 = proc_evaluation([args, False])
+        rets_2 = proc_evaluation([args, True])
+    for r1,r2 in zip(rets_1,rets_2):
+        r1.update(r2)
+        print(r1)
