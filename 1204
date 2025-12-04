@@ -1,83 +1,15 @@
-import numpy as np
 
-def unified_id_to_str(unified_id_val):
-    # 统一转成稳定字符串，list/tuple/set 都能处理
-    if isinstance(unified_id_val, (list, tuple, set)):
-        try:
-            items = sorted(unified_id_val)          # set 无序，排序保证稳定
-        except TypeError:
-            items = sorted(map(str, unified_id_val)) # 混合类型时兜底
-        return "_".join(map(str, items))
-    return str(unified_id_val)
-
-flow_segments = []
-
-mapping_txt_path = "flowsegment_name_map.txt"
-with open(mapping_txt_path, "w", encoding="utf-8") as f_map:
-    f_map.write("# ifc_name\tunified_id(block)\n")
-
-    for idx, cylinder in enumerate(cylinders):
-        start = cylinder['start']
-        end = cylinder['end']
-        radius = cylinder['radius']
-
-        if np.linalg.norm(np.subtract(end, start)) == 0:
-            continue
-
-        if 'unified_id' not in cylinder:
-            print(f"Warning: Missing unified_id in {cylinder}")
-            continue
-
-        unified_id_str = unified_id_to_str(cylinder['unified_id'])
-
-        # 你的原命名方式：不做 0000
-        original_name = cylinder.get('name', "FlowSegment")
-        new_name = f"{original_name}_{idx}"
-        print(f"Generated name: {new_name}")
-
-        # 只写 txt 映射
-        f_map.write(f"{new_name}\t{unified_id_str}\n")
-
-        # ---- 下面你的 IFC 创建逻辑照旧 ----
-        flow_segment = ifc_file.create_entity(
-            'IfcFlowSegment',
-            GlobalId=ifcopenshell.guid.new(),
-            OwnerHistory=owner_history,
-            Name=new_name,
-            ObjectPlacement=ifc_file.createIfcLocalPlacement(storey_placement, axis_placement)
-        )
-
-        cylinder_geometry = create_cylinder_geometry(ifc_file, start, end, radius, context)
-        flow_segment.Representation = ifc_file.create_entity(
-            'IfcProductDefinitionShape',
-            Representations=[cylinder_geometry]
-        )
-
-        pset = ifcopenshell.api.run(
-            "pset.add_pset",
-            ifc_file,
-            product=flow_segment,
-            name="Property"
-        )
-
-        length = get_length(cylinder)
-        confidence = cylinder.get('confidence', cylinder.get('coverage', 1.))
-
-        properties = {
-            'length': (f"{length:.3f}", "IfcLengthMeasure"),
-            'StartPoint': (f"({start[0]:.3f}, {start[1]:.3f}, {start[2]:.3f})", "IfcLabel"),
-            'EndPoint': (f"({end[0]:.3f}, {end[1]:.3f}, {end[2]:.3f})", "IfcLabel"),
-            'Radius': (f"{radius:.3f}", "IfcLengthMeasure"),
-            'Diameter': (f"{radius * 2:.3f}", "IfcLengthMeasure"),
-            'Confidence': (f"{confidence:.3f}", "IfcNormalisedRatioMeasure"),
-        }
-
-        ifcopenshell.api.pset.edit_pset(
-            ifc_file,
-            pset,
-            properties={k: v[0] for k, v in properties.items()}
-        )
-
-        flow_segments.append(flow_segment)
-
-print("Saved mapping txt:", mapping_txt_path)
+Traceback (most recent call last):
+  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 885, in <module>
+    rets_1 = proc_evaluation([args, False])
+  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 819, in proc_evaluation
+    rets.append(proc_dataset(files,infos,setname!='all set',low_quality_coverage=th_bad_set,
+  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 733, in proc_dataset
+    r_list = [eval_global(pred_all, gt,enable_complete,is_merged, thr_coverage)]
+  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 722, in eval_global
+    save_more_files(gt, up, ug, vis_output_dir, pred_all, merged)
+  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 674, in save_more_files
+    create_ifc_file(lst_cyl_gt, path_gt_cyls, path_flowsegment_name_map)
+  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/cylinders2IFC_v2.py", line 473, in create_ifc_file
+    with open(mapping_txt_path, "w", encoding="utf-8") as f_map:
+TypeError: expected str, bytes or os.PathLike object, not NoneType
