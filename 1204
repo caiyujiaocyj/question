@@ -1,5 +1,5 @@
 flow_segments = []
-    for cylinder in cylinders:
+    for idx,cylinder in cylinders:
         start = cylinder['start']
         end = cylinder['end']
         radius = cylinder['radius']
@@ -21,7 +21,7 @@ flow_segments = []
         
         # 生成名称
         original_name = cylinder.get('name', "FlowSegment")
-        new_name = f"{original_name}_{unified_id}"
+        new_name = f"{original_name}_{idx}"
         print(f"Generated name: {new_name}")  # 调试输出
 
         # 创建IFC的流动段（IfcFlowSegment）
