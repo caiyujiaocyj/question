@@ -1,1 +1,15 @@
 
+import numpy as np
+
+npz_path = "/path/to/xxx.npz"
+
+data = np.load(npz_path, allow_pickle=True)
+sur_normals = data["sur_normals"].item()      # dict
+normals = sur_normals["normals"]              # (N,3) 例如键名叫 normals
+
+mean = normals.mean(axis=0)                   # (3,)
+var_xyz = ((normals - mean) ** 2).mean(axis=0)  # (3,) -> var_x,var_y,var_z
+var_sum = var_xyz.sum()                       # Var(nx)+Var(ny)+Var(nz)
+
+print("var_x,var_y,var_z:", var_xyz)
+print("var_sum:", var_sum)
