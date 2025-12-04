@@ -1,4 +1,1 @@
-Traceback (most recent call last):
-  File "D:\cyj\fitting_latest\cyj\plane_or_cylinder.py", line 113, in <module>
-    sur_normals = data["sur_normals"].item()      # dict
-ValueError: can only convert an array of size 1 to a Python scalar
+
