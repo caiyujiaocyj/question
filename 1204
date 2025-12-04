@@ -1,15 +1,1 @@
 
-Traceback (most recent call last):
-  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 885, in <module>
-    rets_1 = proc_evaluation([args, False])
-  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 819, in proc_evaluation
-    rets.append(proc_dataset(files,infos,setname!='all set',low_quality_coverage=th_bad_set,
-  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 733, in proc_dataset
-    r_list = [eval_global(pred_all, gt,enable_complete,is_merged, thr_coverage)]
-  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 722, in eval_global
-    save_more_files(gt, up, ug, vis_output_dir, pred_all, merged)
-  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/evaluation_global_L15.py", line 674, in save_more_files
-    create_ifc_file(lst_cyl_gt, path_gt_cyls, path_flowsegment_name_map)
-  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/cylinders2IFC_v2.py", line 473, in create_ifc_file
-    with open(mapping_txt_path, "w", encoding="utf-8") as f_map:
-TypeError: expected str, bytes or os.PathLike object, not NoneType
