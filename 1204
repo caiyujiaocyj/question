@@ -1,1 +1,34 @@
+import numpy as np
+import glob
 
+npz_files = glob.glob(r"D:\cyj\fitting_latest\cyj\data\*.npz")
+
+res = []
+total_points = 0
+
+# 先算每个文件的 N 和 var_sum，并累加总点数
+for f in npz_files:
+    data = np.load(f, allow_pickle=True)
+    normals = data["sur_normals"]  # (N,3)
+
+    mean = normals.mean(axis=0)
+    var_xyz = ((normals - mean) ** 2).mean(axis=0)
+    var_sum = var_xyz.sum()
+    N = normals.shape[0]
+
+    res.append((f, N, var_sum, var_xyz))
+    total_points += N
+
+# 计算加权后的总 var_sum（权重 = N / total_points）
+weighted_var_sum = sum((N / total_points) * var_sum for _, N, var_sum, _ in res)
+
+# 仍然按单文件 var_sum 排序打印
+res.sort(key=lambda x: x[2])
+
+print("file | N | var_sum | weight | weighted_contrib")
+for f, N, var_sum, var_xyz in res:
+    w = N / total_points
+    print(f"{f} | {N} | {var_sum:.6f} | {w:.6f} | {(w*var_sum):.6f}")
+
+print("\nTOTAL_POINTS:", total_points)
+print("WEIGHTED_VAR_SUM:", weighted_var_sum)
