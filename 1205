@@ -1,0 +1,477 @@
+"""
+Usage
+```
+python run.py --results_path res_path --input_path  input_path
+```
+"""
+
+import argparse, ast, importlib, json, os, random
+import time
+from datetime import datetime
+from typing import List, Tuple
+# import matplotlib.pyplot as plt
+import numpy as np
+import glob, pdb
+from tqdm import tqdm
+from multiprocessing import Pool
+import torch
+import torch.nn.functional as F
+import pickle
+from npz2ply import save_clusters_per_block
+
+pn = importlib.import_module("pipe_function")
+debug = False
+evaluate = True
+merge = False
+new_radius_cluster = True
+new_radius_cluster_v2 = True
+
+N2D = True
+REG2CLS_Cluster = False
+REG2CLS_Dir = False
+save_inlier_pcd = True
+saved_name = 'cylinder_fitting_1F'
+strict_merge = False
+if strict_merge:
+    merge = True
+down_sample_factor = 10
+enable_dir_clustering = True
+
+
+if debug:
+    saved_name = saved_name + '_DEBUG'
+if new_radius_cluster:
+    if new_radius_cluster_v2:
+        atol = 0.001
+        saved_name = saved_name + f'_newclusterv2round2_a{atol}'
+    else:
+        atol = 0.001
+        saved_name = saved_name + f'_newcluster_a{atol}'
+if not REG2CLS_Cluster:
+    saved_name = saved_name + '_wo_R2C1st'
+if not REG2CLS_Dir:
+    saved_name = saved_name + '_wo_R2C2nd'
+if not N2D:
+    saved_name = saved_name + '_wo_N2D'
+if not merge:
+    saved_name = saved_name + '_wo_merge'
+elif strict_merge:
+    saved_name = saved_name + '_strictmerge'
+if down_sample_factor!=10:
+    saved_name = saved_name + f'_dsf{down_sample_factor}'
+
+if enable_dir_clustering==False:
+    saved_name = saved_name + '_wo_dc'
+
+#zhh 1127: add time info.
+now = datetime.now()
+saved_name = saved_name + f'_{now.month}_{now.day}_{now.hour}_{now.minute}'
+
+def seed_torch(seed=0):
+	random.seed(seed)
+	os.environ['PYTHONHASHSEED'] = str(seed)
+	np.random.seed(seed)
+	torch.manual_seed(seed)
+	torch.cuda.manual_seed(seed)
+	torch.backends.cudnn.benchmark = True
+	torch.backends.cudnn.deterministic = True
+
+# ────────────────────────── 1. GT I/O ──────────────────────────
+
+def _arr(t):
+    return np.asarray(ast.literal_eval(t.strip()))
+
+
+def load_gt(path: str):
+    if path.endswith('.csv'):
+        arr = np.loadtxt(path, delimiter=',')
+        return [{"start": arr[i, :3], "end": arr[i, 3:6], "radius": arr[i, 6]} for i in range(arr.shape[0])]
+    segs = []
+    s = e = r = None
+    for line in open(path, encoding='utf-8'):
+        l = line.strip()
+        if l.startswith('Start'):
+            s = _arr(l.split('Start:')[-1])
+        elif l.startswith('End'):
+            e = _arr(l.split('End:')[-1])
+        elif l.startswith('Radius'):
+            r = float(l.split('Radius:')[-1])
+        elif l == '' and s is not None and e is not None and r is not None:
+            segs.append({'start': s, 'end': e, 'radius': r})
+            s = e = r = None
+    if s is not None: segs.append({'start': s, 'end': e, 'radius': r})
+    return segs
+
+
+# ───────────────────── 2. Full cloud loader ───────────────────
+
+def save_cluster_arrays(lbl: np.ndarray, out_dir: str):
+    np.save(os.path.join(out_dir, "cluster_labels.npy"), lbl)
+
+    uniq = np.unique(lbl[lbl >= 0])  # ignore -1 noise
+    rng = np.random.default_rng(42)  # fixed seed for repeatability
+    label2col = {lb: rng.random(3) for lb in uniq}  # random RGB 0‑1
+
+    rgb = np.zeros((len(lbl), 3), dtype=np.float32)
+    for lb, col in label2col.items():
+        rgb[lbl == lb] = col
+    np.save(os.path.join(out_dir, "cluster_colors.npy"), rgb)
+
+
+def load_xyz(path):
+    return np.load(path)[:, :3] if path.endswith('.npy') else np.loadtxt(path)[:, :3]
+
+
+# ─────────────────── 3. generate prediction ───────────────────
+
+def radius_reg2cls(radius):
+    # np.unique(np.around(np.array([g['extend_inf']['radius'].item() for g in infos.values()]),2))
+    ref_radius = np.array([0.01 , 0.015, 0.02 , 0.025, 0.03 , 0.035, 0.04 , 0.045, 0.05 ,
+       0.055, 0.06 , 0.065, 0.07 , 0.075, 0.08 , 0.085, 0.09 , 0.095,
+       0.1  , 0.105, 0.11 , 0.115, 0.12 , 0.125, 0.13 , 0.135, 0.14 ,
+       0.145, 0.15 , 0.155, 0.16 , 0.165, 0.17 , 0.175, 0.18 , 0.185,
+       0.19 , 0.195, 0.2  , 0.205, 0.21 , 0.215, 0.22 , 0.225, 0.23 ,
+       0.235, 0.245, 0.25 , 0.265, 0.27 , 0.285, 0.29 , 0.325, 0.345,
+       0.35 , 0.385, 0.395, 0.4  , 0.405, 0.41 , 0.415, 0.42 , 0.425,
+       0.43 , 0.435, 0.44 , 0.445, 0.45 , 0.455, 0.47 , 0.48 , 0.485,
+       0.495, 0.5  , 0.505, 0.535, 0.565, 0.58 , 0.585, 0.59 , 0.595,
+       0.6  , 0.605, 0.61 , 0.615, 0.62 , 0.63 , 0.645, 0.655, 0.675,
+       0.695, 0.735, 0.755, 0.775, 0.8  , 0.895, 0.915, 1.17 , 1.27 ])#99
+    idx = np.array([abs(radius - ref_radius[i]) for i in range(len(ref_radius))]).argmin(axis=0)
+    return ref_radius[idx] 
+
+def dir_reg2cls(dir):
+    # X = sqrt_2_half =  2**0.5*0.5
+    ref_directions = np.array([
+        [ 0.00,  0.71, -0.71, ], [ 0.00,  0.71,  0.71, ], [ 0.71,  -0.71,  0.00,], 
+        [ 0.71,  0.00, -0.71, ], [ 0.71, -0.00,  0.71, ], [ 0.71,   0.71, -0.00,], 
+        [ 0.00,  0.00,  1.00, ], [ 0.00,  1.00,  0.00, ], [ 1.00,   0.00,  0.00,]])
+    def cosine_similarity(pred, target):
+        pred = torch.tensor(pred)
+        target = torch.tensor(target)
+        pred_norm = F.normalize(pred, dim=-1)
+        gt_norm = F.normalize(target, dim=-1)
+        return F.cosine_similarity(pred_norm, gt_norm, dim=-1).abs() 
+    idx = np.array([cosine_similarity(dir, ref_directions[i]) for i in range(len(ref_directions))]).argmax(axis=0)
+    return ref_directions[idx] # new_dir
+
+    # new_dir=[]
+    # for d in dir:
+    #     new_d = ref_directions[
+    #         np.argmax(np.array([cosine_similarity(d,ref_d).mean() for ref_d in ref_directions]))]
+    #     new_dir.append(new_d)
+    # new_dir = np.array(new_dir)
+
+def generate_pred(cloud: str, out_dir,central=False,evaluate=True,merge=True):
+    """Run reconstruction and optionally save intermediate visualisations.
+
+    Args:
+        cloud: point‑cloud file path (.pts / .txt / .npy)
+        out_dir: if provided, three stage PNGs will be written there using the
+                 same names as the original script (step1_*, step2_*, step3_*).
+        central:三个方向的平均值
+    Returns:
+        (2N,4) array of flattened predicted segments.
+    """
+    downsample_factor = 1
+    angle_threshold = 10
+    offset = np.zeros(3)
+    sur_normals=[], 
+
+    if cloud.endswith('.npy'):
+        c, r, surf, d = pn.load_np_data(cloud)
+    elif cloud.endswith('.pts'): 
+        c, r, surf, d, offset, instance_id,sur_normals = pn.load_txt_data(cloud, downsample_factor=downsample_factor,central=central)
+        #c, r, surf, d = pn.load_pts_data(cloud) # before
+    else:
+        c, r, surf, d,offset,instance_id = pn.load_txt_data(cloud,downsample_factor=downsample_factor,central=central)
+
+    # lbl = pn.region_growing_with_direction(c, d,radius=0.02)#0.02
+    # lbl = pn.radius_cluster(c,r)
+    # lbl, n ->d1
+    if c.shape[0]==0:
+        return None, None, None
+    if REG2CLS_Cluster:
+        d = dir_reg2cls(d)
+    # r = radius_reg2cls(r)
+    if new_radius_cluster:
+        if new_radius_cluster_v2:
+            # r = radius_reg2cls(r)
+            r = np.round(r,2)
+            lbl = pn.radius_cluster_v2(c,r,d,atol=atol,enable_dir_clustering=True,angle_threshold=angle_threshold) # 
+            # print(np.unique(lbl))
+        else:
+            r = radius_reg2cls(r)
+            # (points, radius, dir, atol=0.001, enable_dir_clustering=True, angle_threshold=20.0):
+            lbl = pn.radius_cluster(c,r,d,atol=atol,enable_dir_clustering=enable_dir_clustering) # 
+    else:
+        lbl = pn.radius_cluster(c,r,d) # 
+    len_radius_clustering = len(np.unique(lbl))
+    if new_radius_cluster_v2:
+        lbl = pn.hierarchical_region_growing(c,d,lbl,radius=0.1,min_points=25,down_sample_factor=down_sample_factor)#0.02 25
+    else:
+        lbl = pn.hierarchical_region_growing(c,d,lbl,radius=0.1,min_points=5,down_sample_factor=down_sample_factor)#0.02 25
+    len_hierarchical_region_growing = len(np.unique(lbl))
+    print(f'radius clustering:{len_radius_clustering}; hierarchical_region_growing:{len_hierarchical_region_growing}')
+    if N2D:
+        d_n2d = pn.dir_est(sur_normals, lbl) #n2d
+        d_idx_n2d = np.degrees(np.arccos(np.abs((d*d_n2d).sum(1))))>angle_threshold
+        d[d_idx_n2d] = d_n2d[d_idx_n2d]
+
+    if REG2CLS_Dir:
+        d = dir_reg2cls(d)
+    segs,labels = pn.extract_segments(c, r, d, lbl,surf)
+    if merge:
+        if strict_merge:
+            segs = pn.refine_centerline_segments_with_direction(segs,angle_threshold=np.deg2rad(5), distance_threshold=0.05,line_distance_threshold=0.02)# angle_threshold=np.deg2rad(10), distance_threshold=0.2,radius_threshold=0.2,line_distance_threshold=0.05):
+        else:
+            segs = pn.refine_centerline_segments_with_direction(segs,angle_threshold=np.deg2rad(10), distance_threshold=0.2,line_distance_threshold=0.1)# angle_threshold=np.deg2rad(10), distance_threshold=0.2,radius_threshold=0.2,line_distance_threshold=0.05):
+        # print('merge')
+    segs,raw_radius,new_radius = pn.filter_segments(segs)
+    if evaluate:
+        radius_mean_error, radius_accuracy = pn.evaluate_radius_estimation(raw_radius, new_radius,0.2)
+    else:
+        radius_mean_error = radius_accuracy = -1
+    ret_coverages = [seg.cal_coverage() for seg in segs]
+    cl, rad,coverages = pn.flatten_segments(segs)
+
+    # 20250926, mcwei, save for visualization
+    if save_inlier_pcd:
+        # 20251126, cyj, save for visualization, Save cylinder id, corresponding to cluster id
+        res_for_vis = {}
+        res_for_vis['ind_pts'] = instance_id  # Overall indices
+        res_for_vis['results'] = []
+        for i_seg, seg in enumerate(segs):
+            # 从 segment 中取 cluster label（lst_id_cluster 是个 list，正常长度为 1）
+            if hasattr(seg, "lst_id_cluster") and len(seg.lst_id_cluster) > 0:
+                assert len(seg.lst_id_cluster)==1, f'error. seg lst id cluster has {len(seg.lst_id_cluster)} clusters, >1'
+                seg_cluster_label = int(seg.lst_id_cluster[0])
+            else:
+                seg_cluster_label = -1  # 保险：如果没填 lst_id_cluster
+
+            # 构造与 npz 一致的 cluster_id：blockName-ClusterLabel
+            block_name = cloud.split('/')[-1].split('.')[0]
+            if seg_cluster_label >= 0:   seg_cluster_id = f"{block_name}-{seg_cluster_label}"
+            else:   seg_cluster_id = f"{block_name}-seg{i_seg}"
+            seg.cluster_id = seg_cluster_id
+
+            res_for_vis['results'].append(dict(
+                id_in_block=i_seg,  # The local instance id in this block.
+                unified_id=seg_cluster_id,
+                pc_clustered=surf[seg.ind_clustered],
+                ind_clustered=seg.ind_clustered,
+                ind_inlier=seg.ind_inlier,
+                d=d,
+                start=seg.centerline_start,
+                end=seg.centerline_end,
+                radius=seg.radius,
+                length=seg.length,))
+
+        file_save_for_vis = cloud.split('/')[-1] + '.pkl'
+        dir_save_for_vis = os.path.join(out_dir, 'save_for_vis')
+        os.makedirs(dir_save_for_vis, exist_ok=True)
+        pickle.dump(res_for_vis, open(os.path.join(dir_save_for_vis, file_save_for_vis), 'wb'))
+
+    # 20251126, cyj, Save each cluster per block 
+    save_clusters_per_block(out_dir, lbl, block_name, surf, c, r, d, instance_id, sur_normals)
+
+    return np.hstack([cl, rad[:, None]]),offset,radius_mean_error,coverages
+
+
+# ───────────── 4. Liang‑Barsky clipping functions ─────────────
+
+def _clip(p0, p1, mn, mx):
+    t0, t1 = 0., 1.
+    d = p1 - p0
+    for i in range(3):
+        if abs(d[i]) < 1e-12:
+            if p0[i] < mn[i] or p0[i] > mx[i]: return None
+        else:
+            inv = 1. / d[i]
+            tE = (mn[i] - p0[i]) * inv
+            tL = (mx[i] - p0[i]) * inv
+            if tE > tL: tE, tL = tL, tE
+            t0 = max(t0, tE)
+            t1 = min(t1, tL)
+            if t0 > t1: return None
+    return p0 + t0 * d, p0 + t1 * d
+
+
+def clip_gt(gt, xyz, margin=.05):
+    mn = xyz.min(0) - margin
+    mx = xyz.max(0) + margin
+    out = []
+    for g in gt:
+        res = _clip(np.asarray(g['start']), np.asarray(g['end']), mn, mx)
+        if res is None: continue
+        s, e = res
+        out.append({'start': s, 'end': e, 'radius': g['radius']})
+    return out
+
+
+# ───────────────────── 5. matching & metrics ───────────────────
+
+def _ang(u, v):
+    u = u / np.linalg.norm(u)
+    v = v / np.linalg.norm(v)
+    return np.degrees(np.arccos(np.clip(np.dot(u, v), -1, 1)))
+
+
+def _dist(a: dict, b: dict) -> float:
+    """Shortest distance between two finite line segments (a and b).
+
+    Uses the algorithm for the closest distance between two segments in 3‑D.
+    Returns **one scalar distance** in metres.
+    """
+    p, q = a['start'], b['start']
+    u, v = a['end'] - a['start'], b['end'] - b['start']
+    w0 = p - q
+
+    a_len = np.dot(u, u)
+    b_len = np.dot(v, v)
+    ab = np.dot(u, v)
+    aw = np.dot(u, w0)
+    bw = np.dot(v, w0)
+
+    denom = a_len * b_len - ab * ab + 1e-12  # avoid div‑by‑zero
+
+    s = (ab * bw - b_len * aw) / denom
+    t = (a_len * bw - ab * aw) / denom
+
+    s = np.clip(s, 0.0, 1.0)
+    t = np.clip(t, 0.0, 1.0)
+
+    closest_a = p + s * u
+    closest_b = q + t * v
+    return float(np.linalg.norm(closest_a - closest_b))
+
+
+# ───────────────────── 5b. many‑to‑many matching ───────────────────
+
+def match(pred: List[dict], gt: List[dict], dt=0.1, at=30, rr=0.25):
+    """Many‑to‑many: every pred–GT pair passing thresholds is a hit."""
+    matches = []
+    pred_hit = [False] * len(pred)
+    gt_hit = [False] * len(gt)
+    for pi, p in enumerate(pred):
+        for gi, g in enumerate(gt):
+            # print('Here:',p['radius'],g['radius'])
+            # if abs(p['radius']-g['radius'])/(g['radius']+1e-6)>rr: continue
+            if _ang(p['end'] - p['start'], g['end'] - g['start']) > at: continue
+            if _dist(p, g) > dt: continue
+            matches.append((pi, gi))
+            pred_hit[pi] = True
+            gt_hit[gi] = True
+    un_pred = [i for i, ok in enumerate(pred_hit) if not ok]
+    un_gt = [i for i, ok in enumerate(gt_hit) if not ok]
+    return matches, un_pred, un_gt
+
+
+# ───────────────────── 5c. metrics ───────────────────
+
+def metrics(pred, gt, m):
+    tp = len(set(i for i, _ in m))
+    fp = len(pred) - tp
+    fn = len(gt) - len(set(j for _, j in m))
+    prec = tp / (tp + fp + 1e-8)
+    rec = tp / (tp + fn + 1e-8)
+    f1 = 2 * prec * rec / (prec + rec + 1e-8)
+    if tp:
+        dist = np.mean([_dist(pred[i], gt[j]) for i, j in m])
+        ang = np.mean([_ang(pred[i]['end'] - pred[i]['start'], gt[j]['end'] - gt[j]['start']) for i, j in m])
+        rad = np.mean([abs(pred[i]['radius'] - gt[j]['radius']) for i, j in m])
+    else:
+        dist = ang = rad = float('nan')
+    tl = sum(np.linalg.norm(g['end'] - g['start']) for g in gt)
+    ml = sum(np.linalg.norm(gt[j]['end'] - gt[j]['start']) for _, j in m)
+
+    pred_len = sum(np.linalg.norm(p['end'] - p['start']) for p in pred)
+    # 这里似乎写错了，应该是j,_ in m,已经修改
+    match_len = sum(np.linalg.norm(pred[j]['end'] - pred[j]['start']) for j,_ in m)
+
+    return {'precision': prec, 'recall': rec, 'f1': f1, 'mean_end_dist': dist, 'mean_ang_deg': ang, 'mean_rad_err': rad,
+            'completeness': ml / (tl + 1e-8), 'len_precision': match_len / (pred_len + 1e-8), 'tp': tp, 'fp': fp,
+            'fn': fn}
+
+def to_native(seg):
+    return {
+        "ID": seg.get("ID", ""),
+        "start": np.asarray(seg["start"]).tolist(),
+        "end": np.asarray(seg["end"]).tolist(),
+        "radius": float(seg["radius"]),
+    }
+
+
+def proc(file):
+    seed_torch(20251020)
+    #results_path = os.path.dirname(file)
+    results_path = output_path  #zhh: use manually specified result path.
+    out = os.path.join(results_path,saved_name)
+    # file,out = args['file'], args['out']
+    os.makedirs(out, exist_ok=True)
+    file_name = file.split('/')[-1]
+    json_path = os.path.join(out, f'{file_name}.json')
+    pred_json = [{}],
+    pred_num = 0
+    try:
+        pred_arr,offset,radius_mean_error,coverages = generate_pred(file, out, evaluate=evaluate,merge=merge)
+        #generate_pred(cloud: str, out_dir,central=False,evaluate=True,merge=True):
+        if not isinstance(pred_arr,np.ndarray):
+            radius_mean_error = -1
+        else:
+            pred_arr[:, :3] += offset
+            pred_num = pred_arr.shape[0] // 2
+            pred_json = [
+                {
+                    'id': i,
+                    'start': pred_arr[2 * i, :3].tolist(),  # 将 NumPy 数组转为 Python 列表
+                    'end': pred_arr[2 * i + 1, :3].tolist(),
+                    'radius': float(pred_arr[2 * i, 3]),
+                    'confidence': coverages[i]
+                }
+                for i in range(pred_num)
+            ]
+        # 保存为 JSON 文件
+        with open(json_path, 'w') as f:
+            json.dump(pred_json, f, indent=4)
+    except:
+        # print(file)
+        with open(json_path, 'w') as f:
+            json.dump(pred_json, f, indent=4)
+        radius_mean_error = -1
+    return [radius_mean_error, pred_num]
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='evaluation')
+    parser.add_argument('--input_path', 
+                        default='/media/samsung/samsung/yw/L15/results_1119', 
+                        # default="/media/34.92/common-data-2t/data_tmp",
+                        type=str, help='path for input pts')
+    parser.add_argument('--res_path', 
+                        default='/media/samsung/samsung/recons_res/res_zhh_1125', 
+                        # default="/media/34.92/common-data-2t/data_tmp",
+                        type=str, help='path for input pts')
+    parser.add_argument('--mul_proc', action='store_true', help='')
+    parser.set_defaults(mul_proc=True)
+    args = parser.parse_args()
+    output_path = args.res_path
+    files = glob.glob(os.path.join(args.input_path, "*.pts"))
+    if debug:
+        files = [os.path.join(args.input_path,'block_15L_CSF_B_7_1_1.pts')]
+    # files = files[:20]
+    seed_torch(20251020)
+
+    r_list = []
+    if args.mul_proc and debug==False:
+        with Pool(32) as p:
+            r_list = list(tqdm(p.imap(proc, files), total=len(files)))
+    else:
+        for file in tqdm(files):
+            r_list.append(proc(file))
+    
+    if evaluate:
+        r_list = np.array(r_list)
+        RED = r_list[:, 0]
+        RED = RED[RED!=-1]
+        print(f"RED={RED.mean()*100}%")
+        print(f"Instance Num={r_list[:, 1].sum()}")
