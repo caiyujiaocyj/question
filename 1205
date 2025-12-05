@@ -1,1 +1,7 @@
 
+p cloud
+p block_name
+p i_seg
+p seg_cluster_label
+p hasattr(seg, "lst_id_cluster")
+p getattr(seg, "lst_id_cluster", None)
