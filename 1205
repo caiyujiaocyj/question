@@ -1,1 +1,3 @@
-python run_all.py  --input_path "/media/samsung/samsung/yw/L15/results_1119_round3" --res_path '/media/samsung/samsung/recons_res/res_zhh_1128'
+radius clustering:15; hierarchical_region_growing:13
+> /media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/run.py(257)generate_pred()
+-> if seg_cluster_label >= 0:   seg_cluster_id = f"{block_name}-{seg_cluster_label}"
