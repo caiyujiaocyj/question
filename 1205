@@ -1,3 +1,1 @@
-radius clustering:15; hierarchical_region_growing:13
-> /media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/run.py(257)generate_pred()
--> if seg_cluster_label >= 0:   seg_cluster_id = f"{block_name}-{seg_cluster_label}"
+
