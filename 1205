@@ -1,7 +1,13 @@
-
-p cloud
-p block_name
-p i_seg
-p seg_cluster_label
-p hasattr(seg, "lst_id_cluster")
-p getattr(seg, "lst_id_cluster", None)
+(Pdb) p cloud                                                                                                                                                                  
+'/media/samsung/samsung/yw/L15/results_1119/block_15L_CSF_C_0_0_0.pts'
+(Pdb) p block_name
+'block_15L_CSF_C_0_0_0'
+(Pdb) p i_seg
+0
+(Pdb) p seg_cluster_label
+0
+(Pdb) p hasattr(seg, "lst_id_cluster")
+True
+(Pdb) p getattr(seg, "lst_id_cluster", None)
+[0]
+(Pdb) 
