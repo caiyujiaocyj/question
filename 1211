@@ -1,1 +1,106 @@
+import numpy as np
 
+def _normalize(v, eps=1e-8):
+    v = np.asarray(v, dtype=float)
+    n = np.linalg.norm(v)
+    if n < eps:
+        raise ValueError("Zero-length vector cannot be normalized.")
+    return v / n
+
+def gap_points_for_single_broken_cylinder(cyn1, cyn2, pc, margin=0.0):
+    """
+    专门用于：一根柱子被“掰成两段”，中间断了一节，有一段空隙。
+
+    参数
+    ----
+    cyn1, cyn2 : dict
+        形如：
+        {
+            "start": (x, y, z),
+            "end": (x, y, z),
+            "radius": float
+        }
+        假设两段柱体轴线是共线/近似共线的。
+    pc : (N, 3) array_like
+        点云 (x, y, z)
+    margin : float
+        径向上的“放宽”距离，比如0.01、0.02，
+        让空隙区域稍微厚一点，避免太严格。
+
+    返回
+    ----
+    idx : (M,) np.ndarray[int]
+        落在“中间断掉那一段空隙”里的点的索引
+    """
+
+    pc = np.asarray(pc, dtype=float)
+
+    # 1. 把输入拆出来
+    s1 = np.asarray(cyn1["start"], dtype=float)
+    e1 = np.asarray(cyn1["end"], dtype=float)
+    s2 = np.asarray(cyn2["start"], dtype=float)
+    e2 = np.asarray(cyn2["end"], dtype=float)
+
+    r1 = float(cyn1["radius"])
+    r2 = float(cyn2["radius"])
+    r_max = max(r1, r2)
+
+    # 2. 用第一段柱体定义“黄瓜方向”（轴向）
+    axis_vec = e1 - s1
+    u = _normalize(axis_vec)  # 单位向量，表示柱子的方向
+
+    # 选一个统一的原点来投影（随便，但要固定），这里用 s1
+    origin = s1
+
+    # 3. 计算两段柱子的轴向范围（在 u 方向上的投影标量）
+    def proj(p):
+        # 点 p 在轴向上的标量坐标：t = dot(p - origin, u)
+        return np.dot(p - origin, u)
+
+    s1_t = proj(s1)
+    e1_t = proj(e1)
+    s2_t = proj(s2)
+    e2_t = proj(e2)
+
+    seg1_min = min(s1_t, e1_t)
+    seg1_max = max(s1_t, e1_t)
+    seg2_min = min(s2_t, e2_t)
+    seg2_max = max(s2_t, e2_t)
+
+    # 4. 找到“中间断掉的那一段”的轴向区间 [gap_min, gap_max]
+    # 情况1: 段1在前，段2在后: [seg1_min, seg1_max] ... [seg2_min, seg2_max]
+    if seg1_max < seg2_min:
+        gap_min = seg1_max
+        gap_max = seg2_min
+    # 情况2: 段2在前，段1在后: [seg2_min, seg2_max] ... [seg1_min, seg1_max]
+    elif seg2_max < seg1_min:
+        gap_min = seg2_max
+        gap_max = seg1_min
+    else:
+        # 两段有重叠或者紧挨着，没有明显“空隙”
+        return np.zeros((0,), dtype=int)
+
+    # 如果 gap 太小（几乎没空隙），直接返回空
+    if gap_max <= gap_min:
+        return np.zeros((0,), dtype=int)
+
+    # 5. 对所有点：
+    #    (1) 算它在轴向上的标量 t
+    #    (2) 算它到轴线的横向距离（径向距离）
+    #        如果在 gap_min ~ gap_max 之间，且横向距离不超过 r_max + margin
+    #        就认为它在空隙里面
+    vec = pc - origin          # (N, 3)
+    t = vec @ u                # (N,)
+    # 轴线方向分量
+    axis_comp = np.outer(t, u) # (N,3)
+    # 径向向量 = 点相对origin减掉轴向分量
+    radial_vec = vec - axis_comp
+    radial_dist = np.linalg.norm(radial_vec, axis=1)
+
+    mask = (
+        (t >= gap_min) & (t <= gap_max) &        # 在轴向的空隙区间内
+        (radial_dist <= r_max + margin)          # 距离轴线不要太远
+    )
+
+    idx = np.nonzero(mask)[0]
+    return idx
