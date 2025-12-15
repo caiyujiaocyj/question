@@ -1,1 +1,91 @@
 
+def gap_points_for_single_broken_cylinder(cyn1, cyn2, pc, margin):
+    """
+    功能：
+    - 两段共线/近似共线圆柱（cyn1、cyn2）轴向之间存在一段空隙
+    - 在点云 pc 中找出落在“空隙段圆柱包络区域”内的点索引 idx
+
+    返回：
+    - idx: (M,) int 数组，表示 pc 中属于空隙区域的点下标
+    """
+
+    # =========================
+    # Step 1) 输入整理 + 基本参数
+    # 目的：把输入都转成 np.array，并确定判定半径 r_max
+    # 输出（中间量）：
+    #   - pc: (N,3) float 点云
+    #   - s1,e1,s2,e2: (3,) 两段圆柱端点
+    #   - r_max: float = max(r1,r2)，后续径向阈值用 r_max+margin
+    # =========================
+    pc = np.asarray(pc, dtype=float)
+    s1 = np.asarray(cyn1["start"], dtype=float)
+    e1 = np.asarray(cyn1["end"], dtype=float)
+    s2 = np.asarray(cyn2["start"], dtype=float)
+    e2 = np.asarray(cyn2["end"], dtype=float)
+    r_max = max(float(cyn1["radius"]), float(cyn2["radius"]))
+
+    # =========================
+    # Step 2) 建立轴向坐标系（确定圆柱方向 u + 投影原点 origin）
+    # 目的：把 3D 点沿轴方向压成 1D 标量坐标 t（轴向位置）
+    # 输出（中间量）：
+    #   - u: (3,) 单位方向向量（圆柱主方向）
+    #   - origin: (3,) 投影参考点
+    #   - proj(p): 标量投影函数（返回点 p 的轴向坐标 t）
+    # =========================
+    axis_vec = e1 - s1
+    u = _normalize(axis_vec)
+    origin = s1
+
+    def proj(p):
+        return np.dot(p - origin, u)
+
+    # =========================
+    # Step 3) 计算两段圆柱在轴向上的区间，并推导“空隙区间”
+    # 目的：找到 gap=[gap_min, gap_max]（轴向上的断裂区间）
+    # 输出（中间量）：
+    #   - seg1_min, seg1_max: 段1轴向范围
+    #   - seg2_min, seg2_max: 段2轴向范围
+    #   - gap_min, gap_max: 空隙轴向范围
+    # 特殊输出：
+    #   - 若两段重叠/相接：直接返回空 idx=[]
+    # =========================
+    seg1_min, seg1_max = sorted([proj(s1), proj(e1)])
+    seg2_min, seg2_max = sorted([proj(s2), proj(e2)])
+
+    if seg1_max < seg2_min:
+        gap_min, gap_max = seg1_max, seg2_min
+    elif seg2_max < seg1_min:
+        gap_min, gap_max = seg2_max, seg1_min
+    else:
+        return np.zeros((0,), dtype=int)
+
+    if gap_max <= gap_min:
+        return np.zeros((0,), dtype=int)
+
+    # =========================
+    # Step 4) 对点云做几何量计算：轴向坐标 t + 径向距离 radial_dist
+    # 目的：
+    #   - t：判断点是否落在空隙的轴向范围 gap 内
+    #   - radial_dist：判断点是否在圆柱半径（放宽 margin 后）内
+    # 输出（中间量）：
+    #   - t: (N,) 每个点的轴向标量坐标
+    #   - radial_dist: (N,) 每个点到轴线的径向距离
+    # =========================
+    vec = pc - origin          # (N,3)
+    t = vec @ u                # (N,)
+    radial_vec = vec - np.outer(t, u)
+    radial_dist = np.linalg.norm(radial_vec, axis=1)
+
+    # =========================
+    # Step 5) 组合条件筛选并返回索引
+    # 目的：同时满足“轴向在空隙”+“径向在半径范围内”的点就是空隙点
+    # 输出（最终结果）：
+    #   - mask: (N,) bool
+    #   - idx: (M,) int，mask 为 True 的点索引
+    # =========================
+    mask = (
+        (t >= gap_min) & (t <= gap_max) &
+        (radial_dist <= r_max + margin)
+    )
+    idx = np.nonzero(mask)[0]
+    return idx
