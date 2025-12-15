@@ -1,3 +1,14 @@
+"""
+    主函数 find_cylinder_connection_indices
+   功能：
+   - 两段垂直圆柱（cyn1、cyn2）相连
+   - 在点云 pc 中找出落在“连接区域”内的点索引 idx
+
+   - 返回：
+      idx: 原始 pc 的全局索引
+      center_big: 用于大AABB的中心（线段最近点中点）
+      center_joint: “假设相交”的交点中心（无限直线的交汇点）
+   """
 import numpy as np
 
 def _closest_points_on_segments(p1, q1, p2, q2, eps=1e-9):
