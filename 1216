@@ -133,9 +133,10 @@ def process_blocks(fname_gt: str, fdir_pc: str, out_dir: str, max_radius: float 
     if len(block_files) == 0:
         raise FileNotFoundError(f"No block txt files found under: {fdir_pc} with pattern {glob_pattern}")
 
-    print(f"[INFO] total cylinders parsed: {len(all_cyls)}")
-    print(f"[INFO] cylinders after radius<{max_radius}: {len(useful_cyls)}")
-    print(f"[INFO] total blocks: {len(block_files)}")
+    print(f"total cylinders parsed: {len(all_cyls)}")
+    print(f"cylinders after radius<{max_radius}: {len(useful_cyls)}")
+    print(f"total blocks: {len(block_files)}")
+    print(f"len_ext: {len_ext}")
     os.makedirs(out_dir, exist_ok=True)
 
     for bi, block_txt in enumerate(block_files):
@@ -160,25 +161,26 @@ def process_blocks(fname_gt: str, fdir_pc: str, out_dir: str, max_radius: float 
         else:
             final_idx = np.unique(np.concatenate(reserved_idx_list, axis=0))
 
-        out_name = os.path.splitext(os.path.basename(block_txt))[0] + "_cyn.txt"
+        out_name = os.path.splitext(os.path.basename(block_txt))[0] + "_pc.txt"
         out_path = os.path.join(out_dir, out_name)
-        save_pc_xyz(pts[final_idx], out_path)
+        if final_idx.size > 0:
+            save_pc_xyz(pts[final_idx], out_path)
 
         if (bi + 1) % 10 == 0 or bi == 0 or bi == len(block_files) - 1:
-            print(f"[INFO] {bi+1}/{len(block_files)} saved: {out_path} (kept {final_idx.size}/{pts.shape[0]})")
+            print(f"{bi+1}/{len(block_files)} saved: {out_path} (kept {final_idx.size}/{pts.shape[0]})")
 
 
 if __name__ == "__main__":
     fname_gt = "D:\\cyj\P&D_15L_ABC_seg1.0.pkl"
     fdir_pc = "D:\cyj\\txt1216"
-
-    out_dir = os.path.join(fdir_pc, "pc_near_cylinders")
-
+    out_pc = "D:\\cyj\\txt1216"
+    len_ext = 0.02
+    out_dir = os.path.join(out_pc, f"pc_near_cylinders_len_ext={len_ext:.2f}")
     process_blocks(
         fname_gt=fname_gt,
         fdir_pc=fdir_pc,
         out_dir=out_dir,
         max_radius=0.02,
-        len_ext=0.02,
+        len_ext=len_ext,
         glob_pattern="*.txt",
     )
