@@ -1,1 +1,21 @@
+reserved_idx_list = []
 
+for c in clipped:
+    start = np.asarray(c["start"], dtype=np.float32)
+    end = np.asarray(c["end"], dtype=np.float32)
+    radius = float(c["radius"]) + len_ext  # 放大半径（你原来的做法）
+
+    mask = get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=len_ext)  # (N,) bool
+    idx = np.where(mask)[0].astype(np.int64)  # 变成索引 (K,)
+
+    if idx.size > 0:
+        reserved_idx_list.append(idx)
+
+# 拼接 + 去重
+if len(reserved_idx_list) == 0:
+    final_idx = np.array([], dtype=np.int64)
+else:
+    final_idx = np.unique(np.concatenate(reserved_idx_list, axis=0))  # (M,)
+
+# 用索引取点并保存
+save_pc_xyz(pts[final_idx], out_path)
