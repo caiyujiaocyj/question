@@ -4,15 +4,9 @@ import pickle
 import numpy as np
 from typing import Any, Dict, List, Tuple, Optional
 
-
-# -----------------------------
-# I/O
-# -----------------------------
 def load_pts(file_path_txt: str) -> np.ndarray:
     """Load points from a block txt file. Only use x,y,z (first 3 columns)."""
-    data = np.loadtxt(file_path_txt)  # (N, 7) typically
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
+    data = np.loadtxt(file_path_txt)
     xyz = data[:, :3].astype(np.float32)
     return xyz
 
@@ -28,84 +22,17 @@ def load_pkl(fname: str) -> Any:
         return pickle.load(f)
 
 
-# -----------------------------
-# Cylinder parsing / filtering
-# -----------------------------
-def _to_np3(x: Any) -> np.ndarray:
-    arr = np.asarray(x, dtype=np.float32).reshape(-1)
-    assert arr.size == 3, f"Expected 3D point, got shape {arr.shape}"
-    return arr
-
-
-def extract_cylinders_from_obj(obj: Any) -> List[Dict[str, Any]]:
-    """
-    Recursively traverse obj and collect cylinders.
-    A cylinder is recognized if:
-      - a dict has key 'extend_inf' which contains {'start','end','radius'}
-      - OR a dict itself contains 'start','end','radius'
-    Returns list of dicts: {'start': np(3,), 'end': np(3,), 'radius': float, 'raw': original}
-    """
-    cylinders = []
-
-    def visit(x: Any):
-        if isinstance(x, dict):
-            # case 1: dict has extend_inf
-            if "extend_inf" in x and isinstance(x["extend_inf"], dict):
-                ei = x["extend_inf"]
-                if all(k in ei for k in ("start", "end", "radius")):
-                    try:
-                        cylinders.append({
-                            "start": _to_np3(ei["start"]),
-                            "end": _to_np3(ei["end"]),
-                            "radius": float(ei["radius"]),
-                            "raw": x,
-                        })
-                    except Exception:
-                        pass
-
-            # case 2: dict itself has start/end/radius
-            if all(k in x for k in ("start", "end", "radius")):
-                try:
-                    cylinders.append({
-                        "start": _to_np3(x["start"]),
-                        "end": _to_np3(x["end"]),
-                        "radius": float(x["radius"]),
-                        "raw": x,
-                    })
-                except Exception:
-                    pass
-
-            # keep traversing
-            for v in x.values():
-                visit(v)
-
-        elif isinstance(x, (list, tuple)):
-            for v in x:
-                visit(v)
-
-        # ignore other types
-
-    visit(obj)
-    return cylinders
-
-
 def filter_cyls(cyls: List[Dict[str, Any]], max_radius: float = 0.02) -> List[Dict[str, Any]]:
-    return [c for c in cyls if c["radius"] < max_radius]
+    return [c for c in cyls if c["extend_inf"]["radius"] < max_radius]
 
 
-# -----------------------------
-# BBox + clipping
-# -----------------------------
 def get_bbox(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     mn = np.min(pts, axis=0)
     mx = np.max(pts, axis=0)
     return mn, mx
 
 
-def _clip_segment_to_aabb(p0: np.ndarray, p1: np.ndarray, mn: np.ndarray, mx: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Liang–Barsky style segment-AABB clip. Returns (new_p0, new_p1) or None.
-    """
+def _clip_segment_to_aabb(p0: np.ndarray, p1: np.ndarray, mn: np.ndarray, mx: np.ndarray, radius) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     t0, t1 = 0.0, 1.0
     d = p1 - p0
     for i in range(3):
@@ -122,28 +49,23 @@ def _clip_segment_to_aabb(p0: np.ndarray, p1: np.ndarray, mn: np.ndarray, mx: np
             t1 = min(t1, tL)
             if t0 > t1:
                 return None
-    return p0 + t0 * d, p0 + t1 * d
+    return p0 + t0 * d, p0 + t1 * d, radius
 
 
 def clip_cyls_to_bbox(cyls: List[Dict[str, Any]], mn: np.ndarray, mx: np.ndarray) -> List[Dict[str, Any]]:
-    """
-    Keep cylinders whose axis segment intersects bbox, and replace start/end with clipped segment.
-    """
     out = []
     for c in cyls:
-        res = _clip_segment_to_aabb(c["start"], c["end"], mn, mx)
+        res = _clip_segment_to_aabb(c["extend_inf"]["start"], c["extend_inf"]["end"], mn, mx, c["extend_inf"]["radius"])
         if res is not None:
-            s, e = res
+            s, e, r = res
             cc = dict(c)
             cc["start"] = s
             cc["end"] = e
+            cc["radius"] = r
             out.append(cc)
     return out
 
 
-# -----------------------------
-# Geometry: point-in-cylinder
-# -----------------------------
 def point_to_line_distance_v2(pts: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
     Distance from point(s) to infinite line through segment AB.
@@ -163,72 +85,48 @@ def point_to_line_distance_v2(pts: np.ndarray, a: np.ndarray, b: np.ndarray) -> 
     return np.linalg.norm(pts - proj, axis=1)
 
 
-def get_pc_mask_inside_cylinder(
-    pts: np.ndarray,
-    start: np.ndarray,
-    end: np.ndarray,
-    radius: float,
-    len_ext: float = 0.02
-) -> np.ndarray:
+def get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=0.02):
     """
-    Your described logic: radial distance to axis < radius, and point within extended caps along axis.
+
+    :param pts: (N, 3)
+    :param start: (3,)
+    :param end: (3,)
+    :param radius:
+    :param len_ext: extending length (unit is m), length of the cylinder_plane-1191 used for indices computation is len_cyl + len_ext.
+    :return:
+        mask_inside: (N,)
     """
-    direction = end - start
-    len_cyl = float(np.linalg.norm(direction))
+    direction = end - start  # Cylinder direction.
+    len_cyl = np.linalg.norm(direction)  # Cylinder length.
+    direction = direction / len_cyl  # Normalized cylinder_plane-1191 direction.
+
     if len_cyl < 1e-6:
-        return np.zeros((pts.shape[0],), dtype=bool)
+        mask_inside = np.zeros_like(pts[:, 0], dtype=bool)
+        return mask_inside
 
-    direction = direction / len_cyl
-
-    # 1) radial
+    # Compute the mask: distance<pc, axis> < radius.
     mask_inside_along_normal = point_to_line_distance_v2(pts, start, end) < radius
 
-    # 2) between extended planes
-    start_ext = start - direction * len_ext
-    end_ext = end + direction * len_ext
-    ES = start_ext - end_ext
-    SE = -ES
-    SP = pts - start_ext[None, :]
-    EP = pts - end_ext[None, :]
-    mask_inside_along_direction = (np.sum(SP * SE[None, :], axis=1) > 0) & (np.sum(EP * ES[None, :], axis=1) > 0)
+    # Compute the mask: pc is between start_ext and end_ext.
+    start_ext = start - direction * len_ext  # Extended start.
+    end_ext = end + direction * len_ext  # Extended end.
+    ES = start_ext - end_ext  # (3,)
+    SE = -ES  # (3,)
+    SP = pts - start_ext  # (N, 3)
+    EP = pts - end_ext  # (N, 3)
+    mask_inside_along_direction = (np.sum(SP * SE, axis=1) > 0) & (np.sum(EP * ES, axis=1) > 0)
 
-    return mask_inside_along_normal & mask_inside_along_direction
-
-
-def get_pc_inside_cylinder_indices(
-    pts: np.ndarray,
-    cyn: Dict[str, Any],
-    radius_scale: float = 1.2,
-    radius_add: float = 0.0,
-    len_ext: float = 0.02
-) -> np.ndarray:
-    """
-    Return indices of pts inside a (slightly enlarged) cylinder.
-    radius' = radius * radius_scale + radius_add
-    """
-    r = cyn["radius"] * radius_scale + radius_add
-    mask = get_pc_mask_inside_cylinder(pts, cyn["start"], cyn["end"], r, len_ext=len_ext)
-    return np.nonzero(mask)[0]
+    mask_inside = mask_inside_along_normal & mask_inside_along_direction
+    return mask_inside
 
 
-# -----------------------------
-# Main pipeline
-# -----------------------------
-def process_blocks(
-    fname_gt: str,
-    fdir_pc: str,
-    out_dir: str,
-    max_radius: float = 0.02,
-    radius_scale: float = 1.2,
-    radius_add: float = 0.002,
-    len_ext: float = 0.02,
+def process_blocks(fname_gt: str, fdir_pc: str, out_dir: str, max_radius: float = 0.02, len_ext: float = 0.02,
     glob_pattern: str = "*.txt",
 ) -> None:
     """
     For each block txt: keep points near clipped cylinders.
     """
-    obj = load_pkl(fname_gt)
-    all_cyls = extract_cylinders_from_obj(obj)
+    all_cyls = load_pkl(fname_gt)
     useful_cyls = filter_cyls(all_cyls, max_radius=max_radius)
 
     block_files = sorted(glob.glob(os.path.join(fdir_pc, glob_pattern)))
@@ -247,14 +145,13 @@ def process_blocks(
 
         reserved_idx_list = []
         for c in clipped:
-            idx = get_pc_inside_cylinder_indices(
-                pts, c,
-                radius_scale=radius_scale,
-                radius_add=radius_add,
-                len_ext=len_ext
-            )
-            if idx.size > 0:
-                reserved_idx_list.append(idx)
+            start = c["start"]
+            end = c["end"]
+            radius = c["radius"]
+            radius += len_ext
+
+            idx = get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=len_ext)
+            reserved_idx_list.append(idx)
 
         if len(reserved_idx_list) == 0:
             final_idx = np.array([], dtype=np.int64)
@@ -270,11 +167,9 @@ def process_blocks(
 
 
 if __name__ == "__main__":
-    # ---- your paths ----
-    fname_gt = "/media/samsung/samsung/DigitalTwin2025/dataset/HQdata/mcwei_test/GTGen/15L_CSF/3D Modeling_A-D/P&D_15L_ABC_seg1.0.pkl"
-    fdir_pc = "/media/samsung/samsung/DigitalTwin2025/dataset/HQdata/15L_CSF/Area_real_1124_r0.005_x3y3z3_txt"
+    fname_gt = "D:\\cyj\P&D_15L_ABC_seg1.0.pkl"
+    fdir_pc = "D:\cyj\\txt1216"
 
-    # output directory (you can change)
     out_dir = os.path.join(fdir_pc, "pc_near_cylinders")
 
     process_blocks(
@@ -282,8 +177,6 @@ if __name__ == "__main__":
         fdir_pc=fdir_pc,
         out_dir=out_dir,
         max_radius=0.02,
-        radius_scale=1.2,   # enlarge radius multiplicatively
-        radius_add=0.002,   # also add absolute margin (meters)
         len_ext=0.02,
         glob_pattern="*.txt",
     )
