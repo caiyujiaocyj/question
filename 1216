@@ -1,1 +1,80 @@
+def append_pc_xyz(xyz: np.ndarray, out_path: str) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "a") as f:
+        np.savetxt(f, xyz, fmt="%.6f")
 
+
+def get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=0.02):
+    direction = end - start
+    len_cyl = np.linalg.norm(direction)
+
+    if len_cyl < 1e-6:
+        return np.zeros_like(pts[:, 0], dtype=bool)
+
+    direction = direction / len_cyl
+
+    mask_inside_along_normal = point_to_line_distance_v2(pts, start, end) < radius
+
+    start_ext = start - direction * len_ext
+    end_ext = end + direction * len_ext
+    ES = start_ext - end_ext
+    SE = -ES
+    SP = pts - start_ext
+    EP = pts - end_ext
+    mask_inside_along_direction = (np.sum(SP * SE, axis=1) > 0) & (np.sum(EP * ES, axis=1) > 0)
+
+    return mask_inside_along_normal & mask_inside_along_direction
+
+
+def process_blocks(fname_gt: str, fdir_pc: str, out_dir: str, max_radius: float = 0.02, len_ext: float = 0.02,
+                   glob_pattern: str = "*.txt", merged_name: str = "merged_all_pc.txt") -> None:
+
+    all_cyls = load_pkl(fname_gt)
+    useful_cyls = filter_cyls(all_cyls, max_radius=max_radius)
+
+    block_files = sorted(glob.glob(os.path.join(fdir_pc, glob_pattern)))
+    if len(block_files) == 0:
+        raise FileNotFoundError(f"No block txt files found under: {fdir_pc} with pattern {glob_pattern}")
+
+    print(f"total cylinders parsed: {len(all_cyls)}")
+    print(f"cylinders after radius<{max_radius}: {len(useful_cyls)}")
+    print(f"total blocks: {len(block_files)}")
+    print(f"len_ext: {len_ext}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    merged_path = os.path.join(out_dir, merged_name)
+    with open(merged_path, "w") as f:
+        pass
+    print(f"merged file: {merged_path}")
+
+    for bi, block_txt in enumerate(block_files):
+        pts = load_pts(block_txt)
+        mn, mx = get_bbox(pts)
+        clipped = clip_cyls_to_bbox(useful_cyls, mn, mx)
+
+        reserved_idx_list = []
+        for c in clipped:
+            start = c["start"]
+            end = c["end"]
+            radius = c["radius"] + len_ext
+
+            mask_inside = get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=len_ext)
+            idx = np.where(mask_inside)[0].astype(np.int64)
+            if idx.size > 0:
+                reserved_idx_list.append(idx)
+
+        if len(reserved_idx_list) == 0:
+            final_idx = np.array([], dtype=np.int64)
+        else:
+            final_idx = np.unique(np.concatenate(reserved_idx_list, axis=0))
+
+        out_name = os.path.splitext(os.path.basename(block_txt))[0] + "_pc.txt"
+        out_path = os.path.join(out_dir, out_name)
+
+        if final_idx.size > 0:
+            kept_xyz = pts[final_idx]
+            save_pc_xyz(kept_xyz, out_path)       # 单 block
+            append_pc_xyz(kept_xyz, merged_path)  # 合并追加
+
+        if (bi + 1) % 10 == 0 or bi == 0 or bi == len(block_files) - 1:
+            print(f"{bi+1}/{len(block_files)} saved: {out_path} (kept {final_idx.size}/{pts.shape[0]})")
