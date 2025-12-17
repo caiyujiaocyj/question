@@ -1,1 +1,69 @@
+def save_pc_ply(xyz: np.ndarray, out_path: str) -> None:
+    """Save xyz to ASCII PLY (vertex only)."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
+    xyz = np.asarray(xyz, dtype=np.float32)
+    n = xyz.shape[0]
+
+    header = (
+        "ply\n"
+        "format ascii 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "end_header\n"
+    )
+
+    with open(out_path, "w", newline="\n") as f:
+        f.write(header)
+        np.savetxt(f, xyz, fmt="%.6f %.6f %.6f")
+
+
+def append_pc_ply(xyz: np.ndarray, out_path: str) -> None:
+    """
+    Append xyz to an existing ASCII PLY by:
+    - reading and updating 'element vertex N'
+    - inserting new vertices at the end
+    This keeps merged file as a valid single PLY.
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    xyz = np.asarray(xyz, dtype=np.float32)
+    add_n = xyz.shape[0]
+    if add_n == 0:
+        return
+
+    # If file doesn't exist or is empty -> create new ply
+    if (not os.path.exists(out_path)) or os.path.getsize(out_path) == 0:
+        save_pc_ply(xyz, out_path)
+        return
+
+    # Read existing file
+    with open(out_path, "r") as f:
+        lines = f.readlines()
+
+    # Find header end and vertex count line
+    end_header_idx = None
+    vertex_line_idx = None
+    old_n = None
+
+    for i, line in enumerate(lines):
+        if line.startswith("element vertex "):
+            vertex_line_idx = i
+            old_n = int(line.strip().split()[-1])
+        if line.strip() == "end_header":
+            end_header_idx = i
+            break
+
+    if end_header_idx is None or vertex_line_idx is None or old_n is None:
+        raise ValueError(f"{out_path} is not a valid ASCII PLY (missing header fields).")
+
+    new_n = old_n + add_n
+    lines[vertex_line_idx] = f"element vertex {new_n}\n"
+
+    # Append new vertex lines
+    new_vertex_lines = ["%.6f %.6f %.6f\n" % (p[0], p[1], p[2]) for p in xyz]
+
+    with open(out_path, "w") as f:
+        f.writelines(lines)
+        f.writelines(new_vertex_lines)
