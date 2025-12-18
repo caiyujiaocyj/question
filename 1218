@@ -1,87 +1,327 @@
-
+修改这份代码，是得实现：读取all_cyls时，将所有cyls按照他的列表顺序给它加入一个id号
+在逐block处理柱体时，保存每个柱体对应的点云坐标，保存为pkl文件，命名方式：柱体id_对应的block名.pkl, 因为每个柱体的点云坐标可能跨block，所以全部block处理完成之后再将相同id号的pkl文件合并起来，将坐标以字典的形式储存，所有坐标再以list储存，并且能和cyls的id号一一对应
+import os
+import glob
 import pickle
-from typing import Any, List, Dict, Union
-import json
+import numpy as np
+from typing import Any, Dict, List, Tuple, Optional
+
+# def load_pts(file_path_txt: str) -> np.ndarray:
+#     """Load points from a block txt file. Only use x,y,z (first 3 columns)."""
+#     data = np.loadtxt(file_path_txt)
+#     xyz = data[:, :3].astype(np.float32)
+#     return xyz
+
+def load_pts(file_path_txt: str) -> np.ndarray:
+    """Load points from a block txt file. Only use x,y,z (first 3 columns)."""
+    data = np.loadtxt(file_path_txt)
+
+    # 空文件：返回 (0,3)
+    if data.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    # 只有一行时，loadtxt 会给 (M,)；转成 (1,M)
+    data = np.atleast_2d(data)
+
+    # 列数不足 3：直接报清晰错误（也可以选择跳过）
+    if data.shape[1] < 3:
+        raise ValueError(f"{file_path_txt} has {data.shape[1]} columns, need at least 3.")
+
+    xyz = data[:, :3].astype(np.float32)
+    return xyz
+
+
+
+def save_pc_xyz_txt(xyz: np.ndarray, out_path: str) -> None:
+    """Save xyz to txt."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    np.savetxt(out_path, xyz, fmt="%.6f")
+
+
+def append_pc_xyz_txt(xyz: np.ndarray, out_path: str) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "a") as f:
+        np.savetxt(f, xyz, fmt="%.6f")
+
+
+def save_pc_ply(xyz: np.ndarray, out_path: str) -> None:
+    """Save xyz to ASCII PLY (vertex only)."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    xyz = np.asarray(xyz, dtype=np.float32)
+    n = xyz.shape[0]
+
+    header = (
+        "ply\n"
+        "format ascii 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "end_header\n"
+    )
+
+    with open(out_path, "w", newline="\n") as f:
+        f.write(header)
+        np.savetxt(f, xyz, fmt="%.6f %.6f %.6f")
+
+
+def append_pc_ply(xyz: np.ndarray, out_path: str) -> None:
+    """
+    Append xyz to an existing ASCII PLY by:
+    - reading and updating 'element vertex N'
+    - inserting new vertices at the end
+    This keeps merged file as a valid single PLY.
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    xyz = np.asarray(xyz, dtype=np.float32)
+    add_n = xyz.shape[0]
+    if add_n == 0:
+        return
+
+    # If file doesn't exist or is empty -> create new ply
+    if (not os.path.exists(out_path)) or os.path.getsize(out_path) == 0:
+        save_pc_ply(xyz, out_path)
+        return
+
+    # Read existing file
+    with open(out_path, "r") as f:
+        lines = f.readlines()
+
+    # Find header end and vertex count line
+    end_header_idx = None
+    vertex_line_idx = None
+    old_n = None
+
+    for i, line in enumerate(lines):
+        if line.startswith("element vertex "):
+            vertex_line_idx = i
+            old_n = int(line.strip().split()[-1])
+        if line.strip() == "end_header":
+            end_header_idx = i
+            break
+
+    if end_header_idx is None or vertex_line_idx is None or old_n is None:
+        raise ValueError(f"{out_path} is not a valid ASCII PLY (missing header fields).")
+
+    new_n = old_n + add_n
+    lines[vertex_line_idx] = f"element vertex {new_n}\n"
+
+    # Append new vertex lines
+    new_vertex_lines = ["%.6f %.6f %.6f\n" % (p[0], p[1], p[2]) for p in xyz]
+
+    with open(out_path, "w") as f:
+        f.writelines(lines)
+        f.writelines(new_vertex_lines)
+
 
 def load_pkl(fname: str) -> Any:
     with open(fname, "rb") as f:
         return pickle.load(f)
 
-def _normalize_to_list(data: Union[List[Any], Dict[str, Any], str]) -> List[Any]:
-    """把输入统一成 list，兼容 dict / list / JSON字符串"""
-    if isinstance(data, dict):
-        return [data]
-    if isinstance(data, list):
-        return data
-    if isinstance(data, str):
-        try:
-            obj = json.loads(data)
-        except json.JSONDecodeError:
-            return []
-        return obj if isinstance(obj, list) else [obj]
-    return []
 
-def analyze_cyn_data(
-    cyn_data: Union[List[Dict[str, Any]], Dict[str, Any], str],
-    radius_round_ndigits: int = 4
-) -> List[Dict[str, Any]]:
+def filter_cyls(cyls: List[Dict[str, Any]], max_radius: float = 0.02) -> List[Dict[str, Any]]:
+    return [c for c in cyls if c["radius"] < max_radius]
+
+
+def get_bbox(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    mn = np.min(pts, axis=0)
+    mx = np.max(pts, axis=0)
+    return mn, mx
+
+
+def _clip_segment_to_aabb(p0: np.ndarray, p1: np.ndarray, mn: np.ndarray, mx: np.ndarray, radius) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
-    统计相同半径下：总长度(length_sum) + 数量(count)
+    p0, p1, radius: start point, end point and radius of a cyn.
+    mn = [xmin, ymin, zmin], mx = [xmax, ymax, zmax], the bbox information.
     """
-    stats: Dict[float, Dict[str, Any]] = {}
+    t0, t1 = 0.0, 1.0
+    d = p1 - p0
+    for i in range(3):
+        if abs(d[i]) < 1e-12:
+            if p0[i] < mn[i] or p0[i] > mx[i]:
+                return None
+        else:
+            inv = 1.0 / d[i]
+            tE = (mn[i] - p0[i]) * inv
+            tL = (mx[i] - p0[i]) * inv
+            if tE > tL:
+                tE, tL = tL, tE
+            t0 = max(t0, tE)
+            t1 = min(t1, tL)
+            if t0 > t1:
+                return None
+    return p0 + t0 * d, p0 + t1 * d, radius
 
-    cyn_list = _normalize_to_list(cyn_data)
 
-    for cyn in cyn_list:
-        if isinstance(cyn, str):
-            try:
-                cyn = json.loads(cyn)
-            except json.JSONDecodeError:
-                continue
+def clip_cyls_to_bbox(cyls: List[Dict[str, Any]], mn: np.ndarray, mx: np.ndarray) -> List[Dict[str, Any]]:
+    """
+     clip cyls within the bbox range
+     input:
+       cyls : dict information for a cyn, include start point, end point and radius.
+       mn = [xmin, ymin, zmin], mx = [xmax, ymax, zmax], the bbox information.
+     output:
+       cyls : dict information for clipped cyn, include start point, end point and radius.
+       """
+    out = []
+    for c in cyls:
+        res = _clip_segment_to_aabb(c["start"], c["end"], mn, mx, c["radius"])
+        if res is not None:
+            s, e, r = res
+            cc = dict(c)
+            cc["start"] = s
+            cc["end"] = e
+            cc["radius"] = r
+            out.append(cc)
+    return out
 
-        if not isinstance(cyn, dict):
-            continue
 
-        if "radius" not in cyn or "length" not in cyn:
-            continue
+def point_to_line_distance_v2(pts: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Distance from point(s) to infinite line through segment AB.
+    pts: (N,3), a/b: (3,)
+    returns: (N,)
+    """
+    ab = b - a
+    ab2 = np.dot(ab, ab)
+    if ab2 < 1e-12:
+        # degenerate
+        return np.linalg.norm(pts - a[None, :], axis=1)
 
-        try:
-            radius = float(cyn["radius"])
-            length = float(cyn["length"])
-        except (TypeError, ValueError):
-            continue
+    ap = pts - a[None, :]
+    # projection length onto AB (not clamped)
+    t = (ap @ ab) / ab2  # (N,)
+    proj = a[None, :] + t[:, None] * ab[None, :]
+    return np.linalg.norm(pts - proj, axis=1)
 
-        radius_key = round(radius, radius_round_ndigits)
 
-        if radius_key not in stats:
-            stats[radius_key] = {
-                "radius": radius_key,
-                "length_sum": 0.0,
-                "count": 0,
-            }
+def get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=0.02):
+    """
+    :param pts: (N, 3)
+    :param start: (3,)
+    :param end: (3,)
+    :param radius:
+    :param len_ext: extending length (unit is m), length of the cylinder_plane-1191 used for indices computation is len_cyl + len_ext.
+    :return:
+        mask_inside: (N,)
+    """
+    direction = end - start  # Cylinder direction.
+    len_cyl = np.linalg.norm(direction)  # Cylinder length.
+    direction = direction / len_cyl  # Normalized cylinder_plane-1191 direction.
 
-        stats[radius_key]["length_sum"] += length
-        stats[radius_key]["count"] += 1
+    if len_cyl < 1e-6:
+        mask_inside = np.zeros_like(pts[:, 0], dtype=bool)
+        return mask_inside
 
-    return [stats[k] for k in sorted(stats.keys())]
+    # Compute the mask: distance<pc, axis> < radius.
+    mask_inside_along_normal = point_to_line_distance_v2(pts, start, end) < radius
 
-def main():
-    fname_gt = r"D:\cyj\P&D_15L_ABC_seg1.0.pkl"
+    # Compute the mask: pc is between start_ext and end_ext.
+    start_ext = start - direction * len_ext  # Extended start.
+    end_ext = end + direction * len_ext  # Extended end.
+    ES = start_ext - end_ext  # (3,)
+    SE = -ES  # (3,)
+    SP = pts - start_ext  # (N, 3)
+    EP = pts - end_ext  # (N, 3)
+    mask_inside_along_direction = (np.sum(SP * SE, axis=1) > 0) & (np.sum(EP * ES, axis=1) > 0)
+
+    mask_inside = mask_inside_along_normal & mask_inside_along_direction
+    return mask_inside
+
+
+def process_blocks(fname_gt: str, fdir_pc: str, out_dir: str, max_radius: float = 0.02, radius_ext: float = 0.02,
+                   len_ext: float = 0.02, glob_pattern: str = "*.txt", merged_name: str = "merged_all_pc.ply", resume: bool = True
+) -> None:
+    """
+    For each block txt: keep points near clipped cylinders.
+    input:
+        max_radius: maximum radius of filter target cyn
+        radius_ext: extend radius range
+        len_ext: extend cyn's start and end range
+    output:
+        save extract pc's xyz information around cylinders by block.
+        save merge all block saved pc's xyz information.
+    """
     all_cyls = load_pkl(fname_gt)
+    # useful_cyls = filter_cyls(all_cyls, max_radius=max_radius) #只保留半径小于0.02的圆柱
 
-    # 1) 把所有 cyl 的 extend_inf 合并
-    all_extend_inf: List[Any] = []
-    for cyl in all_cyls:
-        extend_inf_data = cyl.get("extend_inf", [])
-        all_extend_inf.extend(_normalize_to_list(extend_inf_data))
+    block_files = sorted(glob.glob(os.path.join(fdir_pc, glob_pattern)))
+    if len(block_files) == 0:
+        raise FileNotFoundError(f"No block txt files found under: {fdir_pc} with pattern {glob_pattern}")
 
-    # 2) 总统计
-    analysis_result = analyze_cyn_data(all_extend_inf, radius_round_ndigits=4)
+    print(f"total cylinders parsed: {len(all_cyls)}")
+    # print(f"cylinders after radius<{max_radius}: {len(useful_cyls)}")
+    print(f"total blocks: {len(block_files)}")
+    print(f"len_ext: {len_ext}")
+    os.makedirs(out_dir, exist_ok=True)
 
-    # 3) 打印总统计结果
-    print("===== 全部圆柱体总统计（按半径汇总）=====")
-    for item in analysis_result:
-        print(f"半径: {item['radius']:.4f}, 总长度: {item['length_sum']:.4f}, 数量: {item['count']}")
+    merged_path = os.path.join(out_dir, merged_name)
+
+    if (not resume) or (not os.path.exists(merged_path)):
+            open(merged_path, "w").close()
+            print(f"[init] merged file reset: {merged_path}")
+    else:
+        print(f"[resume] keep existing merged file: {merged_path}")
+
+    for bi, block_txt in enumerate(block_files):
+        out_name = os.path.splitext(os.path.basename(block_txt))[0] + "_pc.ply"
+        out_path = os.path.join(out_dir, out_name)
+
+        # ✅ 如果该 block 已经产出结果（非空），直接跳过
+        if resume and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            if (bi + 1) % 10 == 0 or bi == 0:
+                print(f"{bi+1}/{len(block_files)} skip (already done): {out_path}")
+            continue
+
+        # pts = load_pts(block_txt)
+        try:
+            pts = load_pts(block_txt)
+        except Exception as e:
+            print("[bad file]", block_txt, e)
+            continue
+        mn, mx = get_bbox(pts) #点云所在的bbox
+        clipped = clip_cyls_to_bbox(all_cyls, mn, mx) #只保留bbox内部的圆柱
+
+        reserved_idx_list = []
+        for c in clipped:
+            start = c["start"]
+            end = c["end"]
+            radius = c["radius"] + radius_ext #适当放大圆柱的半径
+
+            mask_inside = get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=len_ext)
+            idx = np.where(mask_inside)[0].astype(np.int64)
+
+            if idx.size > 0:
+                reserved_idx_list.append(idx)
+
+        if len(reserved_idx_list) == 0:
+            final_idx = np.array([], dtype=np.int64)
+        else:
+            final_idx = np.unique(np.concatenate(reserved_idx_list, axis=0)) #对索引去重
+
+        if final_idx.size > 0:
+            save_pc_ply(pts[final_idx], out_path) # 保存抽取的点云坐标
+            append_pc_ply(pts[final_idx], merged_path) #合并保存所有block中抽取的点云坐标
+
+
+        if (bi + 1) % 10 == 0 or bi == 0 or bi == len(block_files) - 1:
+            print(f"{bi+1}/{len(block_files)} saved: {out_path} (kept {final_idx.size}/{pts.shape[0]})")
+
 
 if __name__ == "__main__":
-    main()
+    fname_gt = "/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/cylinder_fitting_wo_merge__11_14_17_56/ifc_merge/11_19_11_33_thick_one_slice/output4_cyns_conf.pkl"
+    fdir_pc = "/media/samsung/samsung/DigitalTwin2025/dataset/HQdata/NArea_real_label_HX_r0.005_ensemble_test_1F_x3y3z3_txt"
+    out_pc = "/media/samsung/samsung/mc.wei/code/fitting_latest/exp/NRDK/baseline_s2/cascade_result_seg_baseline_s1/cylinder_fitting_wo_merge__11_14_17_56/ifc_merge/11_19_11_33_thick_one_slice/labeling/"
+    radius_ext = 0.04
+    out_dir = os.path.join(out_pc, f"pc_near_cylinders_radius_ext={radius_ext:.2f}")
+    process_blocks(
+        fname_gt=fname_gt,
+        fdir_pc=fdir_pc,
+        out_dir=out_dir,
+        max_radius=0.03,
+        radius_ext = radius_ext,
+        len_ext=0.02,
+        glob_pattern="*.txt",
+        merged_name = "merged_all_pc.ply",
+        resume = True
+    )
