@@ -1,1 +1,88 @@
 
+import pickle
+from typing import Any, List, Dict, Union
+import json
+
+def load_pkl(fname: str) -> Any:
+    """加载 pickle 文件"""
+    with open(fname, "rb") as f:
+        return pickle.load(f)
+
+def _normalize_to_list(data: Union[List[Any], Dict[str, Any], str]) -> List[Any]:
+    """把输入统一成 list，兼容 dict / list / JSON字符串"""
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return data
+    if isinstance(data, str):
+        try:
+            obj = json.loads(data)
+        except json.JSONDecodeError:
+            return []
+        return obj if isinstance(obj, list) else [obj]
+    return []
+
+def analyze_cyn_data(
+    cyn_data: Union[List[Dict[str, Any]], Dict[str, Any], str],
+    radius_round_ndigits: int = 4
+) -> List[Dict[str, Any]]:
+    """
+    统计相同半径下：总长度(length_sum) + 数量(count)
+
+    radius_round_ndigits:
+        用于半径分组的四舍五入位数，防止浮点误差导致同半径分不到一组
+    """
+    stats: Dict[float, Dict[str, Any]] = {}
+
+    cyn_list = _normalize_to_list(cyn_data)
+
+    for cyn in cyn_list:
+        # list 里可能还夹着 JSON 字符串
+        if isinstance(cyn, str):
+            try:
+                cyn = json.loads(cyn)
+            except json.JSONDecodeError:
+                continue
+
+        if not isinstance(cyn, dict):
+            continue
+
+        if "radius" not in cyn or "length" not in cyn:
+            continue
+
+        try:
+            radius = float(cyn["radius"])
+            length = float(cyn["length"])
+        except (TypeError, ValueError):
+            continue
+
+        radius_key = round(radius, radius_round_ndigits)
+
+        if radius_key not in stats:
+            stats[radius_key] = {
+                "radius": radius_key,
+                "length_sum": 0.0,
+                "count": 0,
+            }
+
+        stats[radius_key]["length_sum"] += length
+        stats[radius_key]["count"] += 1
+
+    # 按半径排序输出更直观
+    return [stats[k] for k in sorted(stats.keys())]
+
+def main():
+    fname_gt = r"D:\cyj\P&D_15L_ABC_seg1.0.pkl"
+    all_cyls = load_pkl(fname_gt)
+
+    # 你原来是“每个 cyl 单独统计并打印”
+    for i, cyl in enumerate(all_cyls):
+        extend_inf_data = cyl.get("extend_inf", [])
+        analysis_result = analyze_cyn_data(extend_inf_data, radius_round_ndigits=4)
+
+        print(f"\n===== cyl #{i} =====")
+        for item in analysis_result:
+            print(f"半径: {item['radius']:.4f}, 总长度: {item['length_sum']:.4f}, 数量: {item['count']}")
+
+if __name__ == "__main__":
+    main()
