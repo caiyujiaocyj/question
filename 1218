@@ -1,1 +1,87 @@
 
+import pickle
+from typing import Any, List, Dict, Union
+import json
+
+def load_pkl(fname: str) -> Any:
+    with open(fname, "rb") as f:
+        return pickle.load(f)
+
+def _normalize_to_list(data: Union[List[Any], Dict[str, Any], str]) -> List[Any]:
+    """把输入统一成 list，兼容 dict / list / JSON字符串"""
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return data
+    if isinstance(data, str):
+        try:
+            obj = json.loads(data)
+        except json.JSONDecodeError:
+            return []
+        return obj if isinstance(obj, list) else [obj]
+    return []
+
+def analyze_cyn_data(
+    cyn_data: Union[List[Dict[str, Any]], Dict[str, Any], str],
+    radius_round_ndigits: int = 4
+) -> List[Dict[str, Any]]:
+    """
+    统计相同半径下：总长度(length_sum) + 数量(count)
+    """
+    stats: Dict[float, Dict[str, Any]] = {}
+
+    cyn_list = _normalize_to_list(cyn_data)
+
+    for cyn in cyn_list:
+        if isinstance(cyn, str):
+            try:
+                cyn = json.loads(cyn)
+            except json.JSONDecodeError:
+                continue
+
+        if not isinstance(cyn, dict):
+            continue
+
+        if "radius" not in cyn or "length" not in cyn:
+            continue
+
+        try:
+            radius = float(cyn["radius"])
+            length = float(cyn["length"])
+        except (TypeError, ValueError):
+            continue
+
+        radius_key = round(radius, radius_round_ndigits)
+
+        if radius_key not in stats:
+            stats[radius_key] = {
+                "radius": radius_key,
+                "length_sum": 0.0,
+                "count": 0,
+            }
+
+        stats[radius_key]["length_sum"] += length
+        stats[radius_key]["count"] += 1
+
+    return [stats[k] for k in sorted(stats.keys())]
+
+def main():
+    fname_gt = r"D:\cyj\P&D_15L_ABC_seg1.0.pkl"
+    all_cyls = load_pkl(fname_gt)
+
+    # 1) 把所有 cyl 的 extend_inf 合并
+    all_extend_inf: List[Any] = []
+    for cyl in all_cyls:
+        extend_inf_data = cyl.get("extend_inf", [])
+        all_extend_inf.extend(_normalize_to_list(extend_inf_data))
+
+    # 2) 总统计
+    analysis_result = analyze_cyn_data(all_extend_inf, radius_round_ndigits=4)
+
+    # 3) 打印总统计结果
+    print("===== 全部圆柱体总统计（按半径汇总）=====")
+    for item in analysis_result:
+        print(f"半径: {item['radius']:.4f}, 总长度: {item['length_sum']:.4f}, 数量: {item['count']}")
+
+if __name__ == "__main__":
+    main()
