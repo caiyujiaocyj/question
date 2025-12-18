@@ -1,1 +1,364 @@
 
+import os
+import glob
+import pickle
+import numpy as np
+from typing import Any, Dict, List, Tuple, Optional
+
+
+def load_pts(file_path_txt: str) -> np.ndarray:
+    """Load points from a block txt file. Only use x,y,z (first 3 columns)."""
+    data = np.loadtxt(file_path_txt)
+
+    # 空文件：返回 (0,3)
+    if data.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    # 只有一行时，loadtxt 会给 (M,)；转成 (1,M)
+    data = np.atleast_2d(data)
+
+    # 列数不足 3：直接报清晰错误（也可以选择跳过）
+    if data.shape[1] < 3:
+        raise ValueError(f"{file_path_txt} has {data.shape[1]} columns, need at least 3.")
+
+    xyz = data[:, :3].astype(np.float32)
+    return xyz
+
+
+def save_pc_ply(xyz: np.ndarray, out_path: str) -> None:
+    """Save xyz to ASCII PLY (vertex only)."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    xyz = np.asarray(xyz, dtype=np.float32)
+    n = xyz.shape[0]
+
+    header = (
+        "ply\n"
+        "format ascii 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "end_header\n"
+    )
+
+    with open(out_path, "w", newline="\n") as f:
+        f.write(header)
+        np.savetxt(f, xyz, fmt="%.6f %.6f %.6f")
+
+
+def append_pc_ply(xyz: np.ndarray, out_path: str) -> None:
+    """
+    Append xyz to an existing ASCII PLY by:
+    - reading and updating 'element vertex N'
+    - inserting new vertices at the end
+    This keeps merged file as a valid single PLY.
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    xyz = np.asarray(xyz, dtype=np.float32)
+    add_n = xyz.shape[0]
+    if add_n == 0:
+        return
+
+    # If file doesn't exist or is empty -> create new ply
+    if (not os.path.exists(out_path)) or os.path.getsize(out_path) == 0:
+        save_pc_ply(xyz, out_path)
+        return
+
+    # Read existing file
+    with open(out_path, "r") as f:
+        lines = f.readlines()
+
+    # Find header end and vertex count line
+    end_header_idx = None
+    vertex_line_idx = None
+    old_n = None
+
+    for i, line in enumerate(lines):
+        if line.startswith("element vertex "):
+            vertex_line_idx = i
+            old_n = int(line.strip().split()[-1])
+        if line.strip() == "end_header":
+            end_header_idx = i
+            break
+
+    if end_header_idx is None or vertex_line_idx is None or old_n is None:
+        raise ValueError(f"{out_path} is not a valid ASCII PLY (missing header fields).")
+
+    new_n = old_n + add_n
+    lines[vertex_line_idx] = f"element vertex {new_n}\n"
+
+    # Append new vertex lines
+    new_vertex_lines = ["%.6f %.6f %.6f\n" % (p[0], p[1], p[2]) for p in xyz]
+
+    with open(out_path, "w") as f:
+        f.writelines(lines)
+        f.writelines(new_vertex_lines)
+
+
+def load_pkl(fname: str) -> Any:
+    with open(fname, "rb") as f:
+        return pickle.load(f)
+
+
+def get_bbox(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    mn = np.min(pts, axis=0)
+    mx = np.max(pts, axis=0)
+    return mn, mx
+
+
+def _clip_segment_to_aabb(p0: np.ndarray, p1: np.ndarray, mn: np.ndarray, mx: np.ndarray, radius):
+    t0, t1 = 0.0, 1.0
+    d = p1 - p0
+    for i in range(3):
+        if abs(d[i]) < 1e-12:
+            if p0[i] < mn[i] or p0[i] > mx[i]:
+                return None
+        else:
+            inv = 1.0 / d[i]
+            tE = (mn[i] - p0[i]) * inv
+            tL = (mx[i] - p0[i]) * inv
+            if tE > tL:
+                tE, tL = tL, tE
+            t0 = max(t0, tE)
+            t1 = min(t1, tL)
+            if t0 > t1:
+                return None
+    return p0 + t0 * d, p0 + t1 * d, radius
+
+
+def clip_cyls_to_bbox(cyls: List[Dict[str, Any]], mn: np.ndarray, mx: np.ndarray) -> List[Dict[str, Any]]:
+    out = []
+    for c in cyls:
+        res = _clip_segment_to_aabb(c["start"], c["end"], mn, mx, c["radius"])
+        if res is not None:
+            s, e, r = res
+            cc = dict(c)
+            cc["start"] = s
+            cc["end"] = e
+            cc["radius"] = r
+            out.append(cc)
+    return out
+
+
+def point_to_line_distance_v2(pts: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    ab = b - a
+    ab2 = np.dot(ab, ab)
+    if ab2 < 1e-12:
+        return np.linalg.norm(pts - a[None, :], axis=1)
+
+    ap = pts - a[None, :]
+    t = (ap @ ab) / ab2
+    proj = a[None, :] + t[:, None] * ab[None, :]
+    return np.linalg.norm(pts - proj, axis=1)
+
+
+def get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=0.02):
+    direction = end - start
+    len_cyl = np.linalg.norm(direction)
+    if len_cyl < 1e-6:
+        return np.zeros_like(pts[:, 0], dtype=bool)
+
+    direction = direction / len_cyl
+
+    mask_inside_along_normal = point_to_line_distance_v2(pts, start, end) < radius
+
+    start_ext = start - direction * len_ext
+    end_ext = end + direction * len_ext
+    ES = start_ext - end_ext
+    SE = -ES
+    SP = pts - start_ext
+    EP = pts - end_ext
+    mask_inside_along_direction = (np.sum(SP * SE, axis=1) > 0) & (np.sum(EP * ES, axis=1) > 0)
+
+    return mask_inside_along_normal & mask_inside_along_direction
+
+
+def _assign_cyl_ids_inplace(all_cyls: List[Dict[str, Any]]) -> None:
+    """按 all_cyls 原始列表顺序添加 id：0..N-1"""
+    for i, c in enumerate(all_cyls):
+        c["id"] = i
+
+
+def _merge_cyl_pkls(by_block_dir: str, merged_dir: str, num_cyls: int, dedup: bool = False) -> Tuple[Dict[int, np.ndarray], List[np.ndarray]]:
+    """
+    合并 by_block_dir 下的 {id}_{block}.pkl
+    返回：
+      coords_by_id: {id: (Ni,3)}
+      coords_list:  [ (N0,3), (N1,3), ... ] 与 id 一一对应
+    """
+    os.makedirs(merged_dir, exist_ok=True)
+
+    # 收集所有块内 pkl
+    pkl_files = sorted(glob.glob(os.path.join(by_block_dir, "*.pkl")))
+
+    id_to_arrays: Dict[int, List[np.ndarray]] = {i: [] for i in range(num_cyls)}
+
+    for fp in pkl_files:
+        base = os.path.basename(fp)
+        # 期望："{id}_{blockname}.pkl"，blockname 内可能有下划线，所以只 split 一次
+        try:
+            id_str, _rest = base.split("_", 1)
+            cid = int(id_str)
+        except Exception:
+            # 不符合命名规则就跳过
+            continue
+
+        with open(fp, "rb") as f:
+            arr = pickle.load(f)
+
+        if isinstance(arr, np.ndarray) and arr.size > 0:
+            id_to_arrays[cid].append(arr)
+
+    coords_by_id: Dict[int, np.ndarray] = {}
+    coords_list: List[np.ndarray] = []
+
+    for cid in range(num_cyls):
+        parts = id_to_arrays.get(cid, [])
+        if len(parts) == 0:
+            merged = np.empty((0, 3), dtype=np.float32)
+        else:
+            merged = np.concatenate(parts, axis=0).astype(np.float32)
+
+            # 可选：去重（注意：浮点精度去重可能不稳定；默认关）
+            if dedup and merged.shape[0] > 1:
+                # 这里用 view 去重要求精确相同浮点值
+                merged = np.unique(merged, axis=0)
+
+        coords_by_id[cid] = merged
+        coords_list.append(merged)
+
+        # 同时也保存“每个柱体一个合并后的 pkl”
+        with open(os.path.join(merged_dir, f"{cid}.pkl"), "wb") as f:
+            pickle.dump(merged, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # 保存总表
+    with open(os.path.join(merged_dir, "coords_by_id.pkl"), "wb") as f:
+        pickle.dump(coords_by_id, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    with open(os.path.join(merged_dir, "coords_list.pkl"), "wb") as f:
+        pickle.dump(coords_list, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return coords_by_id, coords_list
+
+
+def process_blocks(
+    fname_gt: str,
+    fdir_pc: str,
+    out_dir: str,
+    max_radius: float = 0.02,
+    radius_ext: float = 0.02,
+    len_ext: float = 0.02,
+    glob_pattern: str = "*.txt",
+    merged_name: str = "merged_all_pc.ply",
+    resume: bool = True,
+    save_cyls_with_id: bool = True,
+    dedup_merge: bool = False,
+) -> None:
+    """
+    1) 读取 all_cyls，并按顺序赋 id
+    2) 逐 block：对每个 cyl 保存该 block 内命中的点云坐标为 pkl: {id}_{block}.pkl
+    3) 所有 block 完毕：按 id 合并 pkls，得到 coords_by_id / coords_list
+    """
+    all_cyls = load_pkl(fname_gt)
+    _assign_cyl_ids_inplace(all_cyls)
+
+    block_files = sorted(glob.glob(os.path.join(fdir_pc, glob_pattern)))
+    if len(block_files) == 0:
+        raise FileNotFoundError(f"No block txt files found under: {fdir_pc} with pattern {glob_pattern}")
+
+    print(f"total cylinders parsed: {len(all_cyls)}")
+    print(f"total blocks: {len(block_files)}")
+    print(f"len_ext: {len_ext}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 保存带 id 的 cyls（可选）
+    if save_cyls_with_id:
+        cyls_with_id_path = os.path.join(out_dir, "all_cyls_with_id.pkl")
+        with open(cyls_with_id_path, "wb") as f:
+            pickle.dump(all_cyls, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[save] cyls(with id): {cyls_with_id_path}")
+
+    # 逐 block 的柱体点云 pkl 输出目录
+    cyl_by_block_dir = os.path.join(out_dir, "cyl_pc_by_block")
+    os.makedirs(cyl_by_block_dir, exist_ok=True)
+
+    merged_path = os.path.join(out_dir, merged_name)
+
+    if (not resume) or (not os.path.exists(merged_path)):
+        open(merged_path, "w").close()
+        print(f"[init] merged file reset: {merged_path}")
+    else:
+        print(f"[resume] keep existing merged file: {merged_path}")
+
+    for bi, block_txt in enumerate(block_files):
+        block_name = os.path.splitext(os.path.basename(block_txt))[0]
+
+        out_name = block_name + "_pc.ply"
+        out_path = os.path.join(out_dir, out_name)
+
+        # ✅ 如果该 block 已经产出结果（非空），直接跳过
+        # 注意：如果你希望“即使跳过 ply 也继续补写 cyl pkl”，把下面这段 skip 逻辑改掉即可
+        if resume and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            if (bi + 1) % 10 == 0 or bi == 0:
+                print(f"{bi+1}/{len(block_files)} skip (already done): {out_path}")
+            continue
+
+        try:
+            pts = load_pts(block_txt)
+        except Exception as e:
+            print("[bad file]", block_txt, e)
+            continue
+
+        if pts.shape[0] == 0:
+            # 空点云：直接写空 ply（可选），也不产生任何 cyl pkl
+            save_pc_ply(pts, out_path)
+            if (bi + 1) % 10 == 0 or bi == 0 or bi == len(block_files) - 1:
+                print(f"{bi+1}/{len(block_files)} saved: {out_path} (empty block)")
+            continue
+
+        mn, mx = get_bbox(pts)
+        clipped = clip_cyls_to_bbox(all_cyls, mn, mx)  # bbox 内 cyl（仍带原始 id）
+
+        reserved_idx_list = []
+        for c in clipped:
+            cid = c["id"]
+            start = c["start"]
+            end = c["end"]
+            radius = c["radius"] + radius_ext
+
+            mask_inside = get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=len_ext)
+            idx = np.where(mask_inside)[0].astype(np.int64)
+
+            # ---- 保存“该柱体在该 block 的点云坐标” ----
+            if idx.size > 0:
+                xyz_hit = pts[idx].astype(np.float32)
+                pkl_name = f"{cid}_{block_name}.pkl"
+                pkl_path = os.path.join(cyl_by_block_dir, pkl_name)
+                with open(pkl_path, "wb") as f:
+                    pickle.dump(xyz_hit, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+                reserved_idx_list.append(idx)
+
+        # block 级别：合并所有 cyl 的 idx，输出 block 的 ply & 总 merged ply
+        if len(reserved_idx_list) == 0:
+            final_idx = np.array([], dtype=np.int64)
+        else:
+            final_idx = np.unique(np.concatenate(reserved_idx_list, axis=0))
+
+        if final_idx.size > 0:
+            save_pc_ply(pts[final_idx], out_path)
+            append_pc_ply(pts[final_idx], merged_path)
+
+        if (bi + 1) % 10 == 0 or bi == 0 or bi == len(block_files) - 1:
+            print(f"{bi+1}/{len(block_files)} saved: {out_path} (kept {final_idx.size}/{pts.shape[0]})")
+
+    # ---- 所有 blocks 完成后：按 id 合并 pkl ----
+    cyl_merged_dir = os.path.join(out_dir, "cyl_pc_merged")
+    coords_by_id, coords_list = _merge_cyl_pkls(
+        by_block_dir=cyl_by_block_dir,
+        merged_dir=cyl_merged_dir,
+        num_cyls=len(all_cyls),
+        dedup=dedup_merge,
+    )
+    print(f"[merge done] merged per-cylinder pkls & tables saved under: {cyl_merged_dir}")
