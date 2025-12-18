@@ -6,3 +6,29 @@ Traceback (most recent call last):
   File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/extract_pc_around_cyns.py", line 10, in load_pts
     xyz = data[:, :3].astype(np.float32)
 IndexError: too many indices for array: array is 1-dimensional, but 2 were indexed
+
+
+def load_pts(file_path_txt: str) -> np.ndarray:
+    """Load points from a block txt file. Only use x,y,z (first 3 columns)."""
+    data = np.loadtxt(file_path_txt)
+
+    # 空文件：返回 (0,3)
+    if data.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    # 只有一行时，loadtxt 会给 (M,)；转成 (1,M)
+    data = np.atleast_2d(data)
+
+    # 列数不足 3：直接报清晰错误（也可以选择跳过）
+    if data.shape[1] < 3:
+        raise ValueError(f"{file_path_txt} has {data.shape[1]} columns, need at least 3.")
+
+    xyz = data[:, :3].astype(np.float32)
+    return xyz
+
+
+try:
+    pts = load_pts(block_txt)
+except Exception as e:
+    print("[bad file]", block_txt, e)
+    continue
