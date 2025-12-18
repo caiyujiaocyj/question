@@ -1,49 +1,8 @@
-
-def process_blocks(..., merged_name: str = "merged_all_pc.ply", resume: bool = True) -> None:
-    ...
-    os.makedirs(out_dir, exist_ok=True)
-
-    merged_path = os.path.join(out_dir, merged_name)
-
-    # ✅ 续跑时不要清空 merged
-    if (not resume) or (not os.path.exists(merged_path)):
-        open(merged_path, "w").close()
-        print(f"[init] merged file reset: {merged_path}")
-    else:
-        print(f"[resume] keep existing merged file: {merged_path}")
-
-    for bi, block_txt in enumerate(block_files):
-        out_name = os.path.splitext(os.path.basename(block_txt))[0] + "_pc.ply"
-        out_path = os.path.join(out_dir, out_name)
-
-        # ✅ 如果该 block 已经产出结果（非空），直接跳过
-        if resume and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            if (bi + 1) % 10 == 0 or bi == 0:
-                print(f"{bi+1}/{len(block_files)} skip (already done): {out_path}")
-            continue
-
-        pts = load_pts(block_txt)
-        mn, mx = get_bbox(pts)
-        clipped = clip_cyls_to_bbox(all_cyls, mn, mx)
-
-        reserved_idx_list = []
-        for c in clipped:
-            start = c["start"]
-            end = c["end"]
-            radius = c["radius"] + radius_ext
-            mask_inside = get_pc_mask_inside_cylinder(pts, start, end, radius, len_ext=len_ext)
-            idx = np.where(mask_inside)[0].astype(np.int64)
-            if idx.size > 0:
-                reserved_idx_list.append(idx)
-
-        if len(reserved_idx_list) == 0:
-            final_idx = np.array([], dtype=np.int64)
-        else:
-            final_idx = np.unique(np.concatenate(reserved_idx_list, axis=0))
-
-        if final_idx.size > 0:
-            save_pc_ply(pts[final_idx], out_path)
-            append_pc_ply(pts[final_idx], merged_path)
-
-        if (bi + 1) % 10 == 0 or bi == 0 or bi == len(block_files) - 1:
-            print(f"{bi+1}/{len(block_files)} saved: {out_path} (kept {final_idx.size}/{pts.shape[0]})")
+Traceback (most recent call last):
+  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/extract_pc_around_cyns.py", line 291, in <module>
+    process_blocks(
+  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/extract_pc_around_cyns.py", line 255, in process_blocks
+    pts = load_pts(block_txt)
+  File "/media/samsung/samsung/mc.wei/code/DigitalTwin/src/L15_cyj/extract_pc_around_cyns.py", line 10, in load_pts
+    xyz = data[:, :3].astype(np.float32)
+IndexError: too many indices for array: array is 1-dimensional, but 2 were indexed
