@@ -1,8 +1,9 @@
-修改这个代码，使得最终保存的文件是ply，而不是现在的txt文件import os
+import os
 import glob
 import pickle
 import numpy as np
 from typing import Any, Dict, List, Tuple, Optional
+
 
 def load_pts(file_path_txt: str) -> np.ndarray:
     """Load points from a block txt file. Only use x,y,z (first 3 columns)."""
@@ -152,6 +153,10 @@ def process_blocks(fname_gt: str, fdir_pc: str, out_dir: str, max_radius: float 
     """
     all_cyls = load_pkl(fname_gt)
     useful_cyls = filter_cyls(all_cyls, max_radius=max_radius) #只保留半径小于0.02的圆柱
+
+    for i, cyl in enumerate(all_cyls):
+        radius = cyl["extend_inf"]["radius"]
+        print(f"radius = {radius:.6f}")
 
     block_files = sorted(glob.glob(os.path.join(fdir_pc, glob_pattern)))
     if len(block_files) == 0:
