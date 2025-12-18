@@ -1,1 +1,27 @@
+import pickle
+import numpy as np
 
+def save_pc_ply(xyz: np.ndarray, out_path: str):
+    xyz = np.asarray(xyz, dtype=np.float32)
+    n = xyz.shape[0]
+    header = (
+        "ply\n"
+        "format ascii 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "end_header\n"
+    )
+    with open(out_path, "w") as f:
+        f.write(header)
+        np.savetxt(f, xyz, fmt="%.6f %.6f %.6f")
+
+pkl_path = "7_blockA.pkl"      # 或者 "cyl_pc_merged/7.pkl"
+ply_path = "7_blockA.ply"
+
+with open(pkl_path, "rb") as f:
+    xyz = pickle.load(f)       # xyz: (N,3)
+
+save_pc_ply(xyz, ply_path)
+print("saved:", ply_path)
